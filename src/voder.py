@@ -4831,6 +4831,51 @@ def _validate_text_language(text, supported_langs, context_name):
         return False, detected
     return True, detected
 
+def _sniff_media_container(path):
+    """Guess the real container from the first bytes, ignoring the extension."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(12)
+    except OSError:
+        return ""
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return "MP4/M4A"
+    if head[:4] == b"RIFF":
+        return "WAV"
+    if head[:3] == b"ID3" or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "MP3"
+    if head[:4] == b"OggS":
+        return "OGG"
+    if head[:4] == b"fLaC":
+        return "FLAC"
+    if head[:4] == b"\x1aE\xdf\xa3":
+        return "WebM/Matroska"
+    return ""
+
+
+def transcode_to_wav(path, sample_rate=44100):
+    """Decode any file ffmpeg understands into a temporary WAV.
+
+    Downloads are often named ``.mp3`` but are really MP4/M4A (WhatsApp voice
+    notes, some browsers save that way), which makes the MP3 decoder fail with
+    "Giving up searching valid MPEG header".
+    """
+    try:
+        temp_dir = tempfile.gettempdir()
+        output = os.path.join(temp_dir, f"voder_decoded_{int(time.time() * 1000)}.wav")
+        cmd = [
+            "ffmpeg", "-v", "error", "-i", path, "-vn",
+            "-acodec", "pcm_s16le", "-ar", str(sample_rate), "-ac", "2",
+            "-y", output,
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if os.path.exists(output) and os.path.getsize(output) > 1024:
+            return output
+    except Exception as e:
+        print(f"FFmpeg decode error: {e}")
+    return None
+
+
 def validate_audio_file(path):
     if not os.path.exists(path):
         return False, "File does not exist."
@@ -5052,8 +5097,18 @@ def resolve_target_to_audio(path):
         return extracted, cleanup_files
     valid, msg = validate_audio_file(path)
     if not valid:
-        print(f"Error: {msg}")
-        return None, cleanup_files
+        real = _sniff_media_container(path)
+        if real and real.lower() not in ext:
+            print(f"Note: '{os.path.basename(path)}' is actually {real}, "
+                  f"not {ext.lstrip('.').upper() or 'that format'}.")
+        print(f"Warning: {msg}")
+        print("Trying to decode it with ffmpeg instead...")
+        converted = transcode_to_wav(path)
+        if not converted:
+            print("Error: Could not decode this file.")
+            return None, cleanup_files
+        cleanup_files.append(converted)
+        return converted, cleanup_files
     return path, cleanup_files
 
 def validate_dialogue_source_file(file_path):
@@ -6959,16 +7014,24 @@ def oneline_train(params):
 
             if has_test:
                 script = test_script if test_script else TRAIN_TEST_SCRIPT
-                print(f"Testing trained voice...")
-                results_dir = os.path.join(os.getcwd(), "results")
-                os.makedirs(results_dir, exist_ok=True)
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                test_output = os.path.join(results_dir, f"voder_tts_{voice_name}_test_{timestamp}.wav")
-                success = tts.synthesize(script, test_output)
-                if success:
-                    print(f"Test output saved to: {test_output}")
+                test_ok, _detected = _validate_text_language(
+                    script, set(SUPPORTED_TTS_LANGUAGES), "the standard TTS engine")
+                if not test_ok:
+                    print("Skipping the test audio: the standard engine speaks "
+                          + ", ".join(SUPPORTED_TTS_LANGUAGES.values()) + " only.")
+                    print("The voice was saved. For this language use Enhanced "
+                          "Synthesis (Fish-S2Pro) instead.")
                 else:
-                    print("Warning: Test synthesis failed (voice was still saved)")
+                    print(f"Testing trained voice...")
+                    results_dir = os.path.join(os.getcwd(), "results")
+                    os.makedirs(results_dir, exist_ok=True)
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    test_output = os.path.join(results_dir, f"voder_tts_{voice_name}_test_{timestamp}.wav")
+                    success = tts.synthesize(script, test_output)
+                    if success:
+                        print(f"Test output saved to: {test_output}")
+                    else:
+                        print("Warning: Test synthesis failed (voice was still saved)")
 
         return True
     finally:
