@@ -9,6 +9,16 @@ _libs_dir = os.path.join(_src_dir, "libs")
 if _libs_dir not in sys.path:
     sys.path.insert(0, _libs_dir)
 
+# Windows consoles and pipes default to the legacy ANSI code page (cp1252 on a
+# French install), which turns every "✓" progress message into a fatal
+# UnicodeEncodeError when output is captured. Make our own output UTF-8 so the
+# same job runs from a terminal, a pipe or the GUI console.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 # --- automatic dependency bootstrap -------------------------------------
 # This must run before numpy/torch are imported so a fresh machine can install

@@ -465,6 +465,8 @@ class SubprocessThread(QThread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 cwd=VODER_ROOT,
                 bufsize=1
             )
@@ -4813,6 +4815,14 @@ class VoderGUI(QMainWindow):
 
 
 def launch():
+    # Windows pipes default to the legacy ANSI code page; keep console output
+    # from failing on the checkmarks used in progress messages.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     # Dependencies are normally checked by voder.py before this module is
     # imported; this also covers running the GUI module directly.
     try:
@@ -4822,6 +4832,12 @@ def launch():
         os.environ["VODER_SKIP_DEPS"] = "1"
     except Exception as exc:
         print(f"[deps] Warning: dependency check failed: {exc}", flush=True)
+
+    try:
+        from voders.media_tools import ensure_ffmpeg
+        ensure_ffmpeg()
+    except Exception as exc:
+        print(f"[media] Warning: could not set up ffmpeg: {exc}", flush=True)
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
