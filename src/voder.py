@@ -19,6 +19,10 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# HuggingFace uses a 10 s read timeout by default; that aborts multi-GB model
+# downloads on slow links. Give resume retries room to work.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+
 
 # --- automatic dependency bootstrap -------------------------------------
 # This must run before numpy/torch are imported so a fresh machine can install
@@ -2571,6 +2575,97 @@ def _parse_multi_refs(text):
         return None
     return [m.strip() for m in matches if m.strip()]
 
+
+def _split_text_for_tts(text, max_chars=340):
+    """Split long text into sentence-aligned chunks.
+
+    Neural TTS is autoregressive: a 400-character paragraph is one long silent
+    wait. Splitting at sentence boundaries lets the caller print progress and
+    keeps memory flat. Short text is returned unchanged.
+    """
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    sentences = re.split(r"(?<=[.!?\u2026])\s+", text)
+    chunks = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if current and len(current) + 1 + len(sentence) > max_chars:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip() if current else sentence
+    if current:
+        chunks.append(current)
+
+    # A single run-on sentence can still exceed the limit: break it at a comma
+    # or space rather than sending a huge chunk to the model.
+    final = []
+    for chunk in chunks:
+        while len(chunk) > max_chars:
+            cut = chunk.rfind(",", 0, max_chars)
+            if cut < max_chars // 2:
+                cut = chunk.rfind(" ", 0, max_chars)
+            if cut <= 0:
+                cut = max_chars
+            final.append(chunk[:cut].strip())
+            chunk = chunk[cut:].strip()
+        if chunk:
+            final.append(chunk)
+    return final
+
+
+def _run_with_heartbeat(work, label, interval=15):
+    """Run ``work`` in a thread and print a heartbeat while it is busy.
+
+    Generating one sentence can take a minute on a small GPU, with no output at
+    all. These lines make it obvious that the job is alive, not frozen.
+    """
+    import threading
+
+    box = {}
+
+    def runner():
+        try:
+            box["value"] = work()
+        except BaseException as exc:  # re-raised in the caller below
+            box["error"] = exc
+
+    started = time.time()
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        thread.join(interval)
+        if thread.is_alive():
+            print(f"  ... {label} still working ({time.time() - started:.0f}s)",
+                  flush=True)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _join_audio_parts(parts, sample_rate, gap_seconds=0.06):
+    """Concatenate mono/stereo numpy chunks with a short natural pause."""
+    if len(parts) == 1:
+        return parts[0]
+    gap_len = max(1, int(sample_rate * gap_seconds))
+    first = parts[0]
+    if first.ndim == 1:
+        gap = np.zeros(gap_len, dtype=first.dtype)
+    else:
+        gap = np.zeros((gap_len,) + first.shape[1:], dtype=first.dtype)
+    joined = []
+    for index, part in enumerate(parts):
+        if index:
+            joined.append(gap)
+        joined.append(part)
+    return np.concatenate(joined, axis=0)
+
+
 def _concat_audio_files(file_list, output_path):
     if len(file_list) == 1:
         shutil.copy(file_list[0], output_path)
@@ -3077,6 +3172,9 @@ def _assemble_enhanced_dialogue(dialogue_items, voice_data, tts_design_obj=None,
     temp_dir = tempfile.mkdtemp()
     try:
         clips = []
+        total_words = sum(len(item[2].split()) for item in dialogue_items)
+        print(f"Preparing {len(dialogue_items)} line(s), about {total_words} words...",
+              flush=True)
         sfx_generator = None
         design_audio_tracker = {}
         design_cloned_prompts = {}
@@ -3098,6 +3196,9 @@ def _assemble_enhanced_dialogue(dialogue_items, voice_data, tts_design_obj=None,
             level = directives.get('level', 100)
             raw_file = os.path.join(temp_dir, f"raw_{i:03d}.wav")
             processed_file = os.path.join(temp_dir, f"processed_{i:03d}.wav")
+            if char.lower() != 'sfx':
+                headline = text if len(text) <= 70 else text[:70].rstrip() + "..."
+                print(f"[{i + 1}/{len(dialogue_items)}] {char}: {headline}", flush=True)
             if char.lower() == 'sfx':
                 duration = directives.get('duration')
                 if duration is None:
@@ -3316,12 +3417,21 @@ class QwenTTSVoiceDesign:
         try:
             import soundfile as sf
             import torch
-            wavs, sr = self.model.generate_voice_design(
-                text=text,
-                language=language,
-                instruct=voice_instruct
+            print(f"  Speaking {len(text.split())} words with voice: "
+                  f"{voice_instruct[:60]}{'...' if len(voice_instruct) > 60 else ''}",
+                  flush=True)
+            started = time.time()
+            wavs, sr = _run_with_heartbeat(
+                lambda: self.model.generate_voice_design(
+                    text=text,
+                    language=language,
+                    instruct=voice_instruct
+                ),
+                "speech",
             )
             sf.write(output_path, wavs[0], sr)
+            print(f"  Speech ready: {len(wavs[0]) / sr:.1f}s of audio "
+                  f"in {time.time() - started:.1f}s", flush=True)
             return True
         except Exception as e:
             print(f"VoiceDesign synthesis error: {e}")
@@ -3444,13 +3554,41 @@ class QwenTTS:
             return False
         try:
             import soundfile as sf
-            import torch
-            wavs, sr = self.model.generate_voice_clone(
-                text=text,
-                language=language,
-                voice_clone_prompt=self.voice_prompt
-            )
-            sf.write(output_path, wavs[0], sr)
+            chunks = _split_text_for_tts(text)
+            if not chunks:
+                return False
+            total_chars = sum(len(chunk) for chunk in chunks)
+            print(f"  Speaking {len(text.split())} words ({total_chars} chars) "
+                  f"in {len(chunks)} part(s)...", flush=True)
+            audio_parts = []
+            sample_rate = None
+            for index, chunk in enumerate(chunks, start=1):
+                if len(chunks) > 1:
+                    print(f"  Part {index}/{len(chunks)}: \"{chunk[:70]}"
+                          f"{'...' if len(chunk) > 70 else ''}\"", flush=True)
+                started = time.time()
+                label = (f"part {index}/{len(chunks)}"
+                         if len(chunks) > 1 else "speech")
+                wavs, chunk_sr = _run_with_heartbeat(
+                    lambda chunk=chunk: self.model.generate_voice_clone(
+                        text=chunk,
+                        language=language,
+                        voice_clone_prompt=self.voice_prompt
+                    ),
+                    label,
+                )
+                if sample_rate is None:
+                    sample_rate = chunk_sr
+                audio_parts.append(np.asarray(wavs[0]))
+                if len(chunks) > 1:
+                    print(f"  Part {index}/{len(chunks)} done in "
+                          f"{time.time() - started:.1f}s", flush=True)
+            if sample_rate is None:
+                return False
+            audio = _join_audio_parts(audio_parts, sample_rate)
+            sf.write(output_path, audio, sample_rate)
+            print(f"  Speech ready: {len(audio) / sample_rate:.1f}s of audio",
+                  flush=True)
             return True
         except Exception as e:
             print(f"Synthesis error: {e}")
@@ -8545,7 +8683,8 @@ def oneline_tts(params):
                             pass
     else:
         if not has_colon_script:
-            print("Error: Dialogue script must be in format 'Character: text', got: {s}")
+            print("Error: Dialogue script must be in format 'Character: text', got: "
+                  + "; ".join(scripts))
             return False
         if not _is_all_sfx and not has_colon_voice and not has_colon_target:
             print("Error: Dialogue mode requires voice or target parameters in 'Character: value' format.")
