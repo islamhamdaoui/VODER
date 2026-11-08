@@ -4,6 +4,19 @@ import subprocess
 import platform
 import re
 import time
+import wave
+
+
+def audio_seconds(path):
+    """Length of a WAV file in seconds, or 0 when it cannot be read."""
+    try:
+        with wave.open(path, "rb") as handle:
+            rate = handle.getframerate() or 0
+            if not rate:
+                return 0.0
+            return handle.getnframes() / float(rate)
+    except Exception:
+        return 0.0
 
 def _q(v):
     if not v:
@@ -4258,6 +4271,7 @@ class VoderGUI(QMainWindow):
         self.current_thread = None
         self.audio_player = None
         self.last_output_path = None
+        self.last_command = ""
         self.terminal_visible = False
         self.running = False
         self.player_thread = None
@@ -4443,6 +4457,18 @@ class VoderGUI(QMainWindow):
         self.open_output_btn.clicked.connect(self.open_output_folder)
         audio_row.addWidget(self.open_output_btn)
 
+        self.save_voice_btn = QPushButton("Save as Voice")
+        self.save_voice_btn.setStyleSheet(get_surface_button_style())
+        self.save_voice_btn.setCursor(Qt.PointingHandCursor)
+        self.save_voice_btn.setFixedWidth(110)
+        self.save_voice_btn.setEnabled(False)
+        self.save_voice_btn.setToolTip(
+            "Like the voice in this result? Save it as a named voice you can "
+            "pick again in Speech, forever."
+        )
+        self.save_voice_btn.clicked.connect(self.save_output_as_voice)
+        audio_row.addWidget(self.save_voice_btn)
+
         audio_layout.addLayout(audio_row)
         content_layout.addWidget(audio_frame)
 
@@ -4602,6 +4628,90 @@ class VoderGUI(QMainWindow):
         except Exception:
             pass
 
+    def save_output_as_voice(self):
+        """Turn the audio you just generated into a named, reusable voice.
+
+        The clone is stored in the same voices folder as any other trained
+        voice, so it stays available after a restart and can be picked by name
+        in Speech, Voice Change and Voice Library.
+        """
+        path = self.last_output_path
+        if not path or not os.path.exists(path):
+            QMessageBox.information(
+                self, "No audio yet",
+                "Generate some speech first, then use this button to keep the voice."
+            )
+            return
+        if self.running:
+            QMessageBox.information(
+                self, "Busy", "Wait for the current job to finish, then save the voice."
+            )
+            return
+
+        seconds = audio_seconds(path)
+        if seconds and seconds < 5:
+            answer = QMessageBox.question(
+                self, "Very short sample",
+                f"This clip is only {seconds:.1f} seconds long, so the clone may sound "
+                "unstable.\n\n10-30 seconds of one clean voice gives much better results. "
+                "Try it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if answer != QMessageBox.Yes:
+                return
+        elif seconds > 90:
+            answer = QMessageBox.question(
+                self, "Long sample",
+                f"This clip is {seconds:.0f} seconds long. A clone only needs a short, "
+                "clean piece of one speaker - extra music, other speakers or silence "
+                "makes it worse.\n\nSave it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        if getattr(self, "last_command", "") in ("ttm", "sfx"):
+            answer = QMessageBox.question(
+                self, "This is music, not a clean voice",
+                "This result is a song/effect, so the clone would also learn the "
+                "instruments, the beat and every singer in the mix.\n\n"
+                "For a real voice, separate the vocals first (Separate tab -> Voice), "
+                "then save the singer's track.\n\nSave it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        name, ok = QInputDialog.getText(
+            self, "Save as Voice",
+            "Name for this voice (you will pick it by this name in Speech):"
+        )
+        if not ok:
+            return
+        name = vlib.sanitize_voice_name(name)
+        if not name:
+            QMessageBox.warning(
+                self, "Invalid name",
+                "Please type a name using letters or digits, for example 'emma'."
+            )
+            return
+        if vlib.profiles_for_name(name):
+            answer = QMessageBox.question(
+                self, "Voice already exists",
+                f"A voice named '{name}' already exists. Replace it with this audio?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        self.train_tab.pending_voice_name = name
+        if not self.terminal_visible:
+            self.toggle_terminal()
+        self.console.append(
+            f"\n[save] Creating voice '{name}' from {os.path.basename(path)} ..."
+        )
+        self.run_command(["train", f"voice:{name}", path])
+
     def toggle_terminal(self):
         self.terminal_visible = not self.terminal_visible
         if self.terminal_visible:
@@ -4617,6 +4727,7 @@ class VoderGUI(QMainWindow):
     def run_command(self, args):
         if self.running:
             return
+        self.last_command = args[0] if args else ""
         if hasattr(self, "tts_tab") and self.content_stack.currentWidget() == self.tts_tab:
             self.tts_tab.set_generation_status("Starting VODER… live progress will appear here.")
         self.running = True
@@ -4665,6 +4776,7 @@ class VoderGUI(QMainWindow):
             self.last_output_path = detected
             self.audio_path_edit.setText(detected)
             self.play_btn.setEnabled(True)
+            self.save_voice_btn.setEnabled(True)
             self.waveform.set_audio(detected)
 
     def on_process_finished(self, returncode, output):
@@ -4703,6 +4815,7 @@ class VoderGUI(QMainWindow):
             self.last_output_path = audio_path
             self.audio_path_edit.setText(audio_path)
             self.play_btn.setEnabled(True)
+            self.save_voice_btn.setEnabled(True)
             self.waveform.set_audio(audio_path)
 
     def on_transcribe_finished(self, returncode, output):
@@ -4760,11 +4873,13 @@ class VoderGUI(QMainWindow):
             self.player_thread.stop()
             self.player_thread = None
         self.play_btn.setEnabled(bool(self.last_output_path and os.path.exists(self.last_output_path) if self.last_output_path else False))
+        self.save_voice_btn.setEnabled(bool(self.last_output_path and os.path.exists(self.last_output_path) if self.last_output_path else False))
         self.audio_stop_btn.setEnabled(False)
 
     def on_play_finished(self):
         self.player_thread = None
         self.play_btn.setEnabled(bool(self.last_output_path and os.path.exists(self.last_output_path) if self.last_output_path else False))
+        self.save_voice_btn.setEnabled(bool(self.last_output_path and os.path.exists(self.last_output_path) if self.last_output_path else False))
         self.audio_stop_btn.setEnabled(False)
 
     def stop_process(self):

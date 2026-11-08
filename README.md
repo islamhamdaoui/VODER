@@ -152,6 +152,12 @@ python src/voder.py quest download "https://youtube.com/watch?v=..."
 # Voice training (save a voice clone for reuse in TTS)
 python src/voder.py train voice:narrator "ref1.wav" "ref2.wav"
 python src/voder.py train extreme voice:narrator "ref1.wav"
+# In the GUI: generate speech, then press "Save as Voice" under the player to
+# keep the voice you just heard as a named voice (saved in voices/, forever).
+
+# Speak with a saved voice by name (no 'voice' argument needed)
+python src/voder.py tts script "narrator: Hello there."
+python src/voder.py tts script "narrator: Hello." script "despina: Hi!"  # dialogue
 
 # Chains (wire multiple voder oneline tasks together)
 python src/voder.py chains "song" ttm lyrics "la la la" styling "pop" 30 / "voice" svs voice "song" / "cover" sts base "voice" target "ref.wav"

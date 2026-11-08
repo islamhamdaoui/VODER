@@ -6508,6 +6508,8 @@ def show_oneline_usage():
     print()
     print("Single mode examples:")
     print('  python voder.py tts script "hello world" voice "male voice"')
+    print('  python voder.py tts script "emma: hello world"   (saved voice by name)')
+    print('  python voder.py tts script "emma: hi" script "alex: hello"   (dialogue)')
     print('  python voder.py tts script "hello" target "voice.wav"')
     print('  python voder.py tts ocr "path/to/image.png" voice "text: female voice"')
     print('  python voder.py tts ocr "path/to/image.png" target "text: voice.wav"')
@@ -8471,6 +8473,36 @@ def oneline_tts(params):
         return False
 
     _is_all_sfx = all(s.strip().lower().startswith('sfx:') for s in scripts)
+
+    # "emma: hello there" is the natural way to say "speak this with emma".
+    # When every line starts with the name of a saved voice, that name is the
+    # voice - no separate 'voice' argument needed. Several different names mean
+    # a dialogue, one name means a single speaker.
+    if not voices and not targets and not _is_all_sfx:
+        prefixes = []
+        for s in scripts:
+            head, sep, body = s.partition(':')
+            if not sep or not body.strip():
+                prefixes = []
+                break
+            prefixes.append(head.strip())
+        resolved = [p for p in prefixes if p and _resolve_voice_ref(p, use_extreme=use_extreme)]
+        if prefixes and len(resolved) == len(prefixes):
+            unique = list(dict.fromkeys(p.casefold() for p in prefixes))
+            if len(unique) == 1:
+                scripts = [s.split(':', 1)[1].strip() for s in scripts]
+                voices = [prefixes[0]]
+                print(f"Speaking with saved voice '{prefixes[0]}'.")
+            else:
+                speakers = list(dict.fromkeys(prefixes))
+                voices = [f"{name}: {name}" for name in speakers]
+                print("Dialogue with saved voices: " + ", ".join(speakers))
+        elif prefixes and any(_resolve_voice_ref(p, use_extreme=use_extreme) for p in prefixes if p):
+            unknown = [p for p in prefixes if not _resolve_voice_ref(p, use_extreme=use_extreme)]
+            print("Error: these speakers are not saved voices yet: " + ", ".join(unknown))
+            print("Create one in the GUI's Train tab, or pass voice \"name: value\" explicitly.")
+            return False
+
     if not voices and not targets and not _is_all_sfx:
         print("Error: TTS mode requires at least one 'voice' or 'target' parameter")
         return False
