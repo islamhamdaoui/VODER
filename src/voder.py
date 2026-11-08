@@ -23,6 +23,10 @@ for _stream in (sys.stdout, sys.stderr):
 # downloads on slow links. Give resume retries room to work.
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
+# Reduces fragmentation on small cards; the ACE-Step VAE decode otherwise asks
+# for a 480 MB block while a few hundred MB sit reserved-but-unused.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 # --- automatic dependency bootstrap -------------------------------------
 # This must run before numpy/torch are imported so a fresh machine can install
@@ -4189,12 +4193,24 @@ class AceStepWrapper:
                 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
                 from acestep.handler import AceStepHandler
                 device = "cuda:0" if torch.cuda.is_available() else "cpu"
+                low_vram = False
+                if torch.cuda.is_available():
+                    try:
+                        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                        low_vram = vram_gb < 12.0
+                    except Exception:
+                        low_vram = False
                 print(f"Loading ACE-Step model ({self.config_path})...")
+                if low_vram:
+                    print(f"Low-VRAM mode: offloading ACE-Step stages to CPU "
+                          f"(GPU has {vram_gb:.1f} GB) to avoid out-of-memory.")
                 self.handler = AceStepHandler()
                 status, success = self.handler.initialize_service(
                     project_root=self.checkpoints_dir,
                     config_path=self.config_path,
-                    device=device
+                    device=device,
+                    offload_to_cpu=low_vram,
+                    offload_dit_to_cpu=low_vram,
                 )
                 if not success:
                     print(f"Error initializing ACE-Step: {status}")

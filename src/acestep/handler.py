@@ -344,7 +344,11 @@ class AceStepHandler:
             self.offload_to_cpu = offload_to_cpu
             self.offload_dit_to_cpu = offload_dit_to_cpu
             # Set dtype based on device: bfloat16 for cuda, float32 for cpu
-            self.dtype = torch.bfloat16 if device in ["cuda","xpu"] else torch.float32
+            # "cuda:0" must count as CUDA too: passing a device index used to
+            # fall through to float32, doubling VRAM (and OOM-ing 6 GB cards).
+            self.dtype = (torch.bfloat16
+                          if str(device).split(":")[0] in ("cuda", "xpu")
+                          else torch.float32)
             self.quantization = quantization
             if self.quantization is not None:
                 assert compile_model, "Quantization requires compile_model to be True"
@@ -995,7 +999,9 @@ class AceStepHandler:
     def _get_vae_dtype(self, device: Optional[str] = None) -> torch.dtype:
         """Get VAE dtype based on device."""
         device = device or self.device
-        return torch.bfloat16 if device in ["cuda", "xpu"] else self.dtype
+        return (torch.bfloat16
+                if str(device).split(":")[0] in ("cuda", "xpu")
+                else self.dtype)
     
     def _format_instruction(self, instruction: str) -> str:
         """Format instruction to ensure it ends with colon."""
@@ -2881,7 +2887,30 @@ class AceStepHandler:
                     
                     if use_tiled_decode:
                         logger.info("[generate_music] Using tiled VAE decode to reduce VRAM usage...")
-                        pred_wavs = self.tiled_decode(pred_latents_for_decode)  # [batch, channels, samples]
+                        # Small cards need smaller tiles: the decoder's activation
+                        # for one 512-frame tile is what pushes a 6 GB GPU over.
+                        tile_options = ([(256, 32), (128, 32), (64, 16)]
+                                        if getattr(self, "offload_to_cpu", False)
+                                        else [(512, 64), (256, 32), (128, 32)])
+                        last_error = None
+                        for tile_size, tile_overlap in tile_options:
+                            try:
+                                pred_wavs = self.tiled_decode(
+                                    pred_latents_for_decode,
+                                    chunk_size=tile_size,
+                                    overlap=tile_overlap,
+                                )
+                                break
+                            except RuntimeError as exc:
+                                if "out of memory" not in str(exc).lower():
+                                    raise
+                                last_error = exc
+                                torch.cuda.empty_cache()
+                                logger.warning(
+                                    f"[generate_music] VAE decode ran out of memory "
+                                    f"with tile {tile_size}; retrying with a smaller tile")
+                        else:
+                            raise last_error
                     else:
                         decoder_output = self.vae.decode(pred_latents_for_decode)
                         pred_wavs = decoder_output.sample
