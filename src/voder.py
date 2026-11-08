@@ -96,6 +96,7 @@ from voders.sidequests import (
     SIDE_QUESTS,
     _register_side_quest,
 )
+from voders import voice_library as _voice_lib
 
 PLATFORMS = {
     "youtube": {
@@ -6127,14 +6128,15 @@ def is_num(s):
     except (ValueError, TypeError):
         return False
 
-VOICES_DIR = os.path.join(os.getcwd(), "voices")
+VOICES_DIR = _voice_lib.voices_dir()
 
 def _ensure_voices_dir():
+    _voice_lib.ensure_voices_dir()
     os.makedirs(VOICES_DIR, exist_ok=True)
 
 def _save_voice_prompt(voice_prompt_items, character_name):
     _ensure_voices_dir()
-    character_name = character_name.lower()
+    character_name = _voice_lib.sanitize_voice_name(character_name) or "voice"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     filename = f"voder_tts_{character_name}_{timestamp}.tts"
     filepath = os.path.join(VOICES_DIR, filename)
@@ -6176,63 +6178,20 @@ def _load_voice_prompt(filepath):
         ))
     return items
 
-def _find_voice_file(name):
-    _ensure_voices_dir()
-    if os.path.exists(name) and name.endswith('.tts'):
-        return name
-    name = name.lower()
-    matches = []
-    for f in os.listdir(VOICES_DIR):
-        if not f.endswith('.tts'):
-            continue
-        if f.startswith(f"voder_tts_{name}_"):
-            matches.append(os.path.join(VOICES_DIR, f))
-    if not matches:
-        return None
-    matches.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-    return matches[0]
+def _find_voice_file(name, kind=None, prefer_enhanced=False):
+    """Find a saved voice profile by name (also accepts a file path)."""
+    return _voice_lib.find_voice(name, kind=kind, prefer_enhanced=prefer_enhanced)
 
-def _resolve_voice_ref(value):
-    if ':' not in value:
-        voice_file = _find_voice_file(value.lower())
-        if voice_file:
-            return voice_file
-        return None
-    parts = value.split(':', 1)
-    first = parts[0].strip()
-    second = parts[1].strip().lower()
-    if second.endswith('.tts'):
-        if os.path.exists(second):
-            return second
-        voice_file = _find_voice_file(second)
-        if voice_file:
-            return voice_file
-        return None
-    voice_file = _find_voice_file(second)
-    if voice_file:
-        return voice_file
-    return None
+def _resolve_voice_ref(value, use_extreme=None):
+    """Resolve a saved voice name (or 'Character: name') to a profile path."""
+    return _voice_lib.resolve_voice(value, prefer_enhanced=bool(use_extreme))
 
 def _is_trained_voice_ref(value):
-    if os.path.exists(value) and value.endswith('.tts'):
-        return True
-    if _find_voice_file(value.lower()) is not None:
-        return True
-    if ':' in value:
-        parts = value.split(':', 1)
-        second = parts[1].strip()
-        if second.endswith('.tts'):
-            if os.path.exists(second):
-                return True
-            if _find_voice_file(second.lower()) is not None:
-                return True
-        if _find_voice_file(second.lower()) is not None:
-            return True
-    return False
+    return _voice_lib.resolve_voice(value) is not None
 
 def _save_fish_voice(encoded_refs, character_name, ref_text=None):
     _ensure_voices_dir()
-    character_name = character_name.lower()
+    character_name = _voice_lib.sanitize_voice_name(character_name) or "voice"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     filename = f"voder_ttse_{character_name}_{timestamp}.ttse"
     filepath = os.path.join(VOICES_DIR, filename)
@@ -6256,57 +6215,17 @@ def _load_fish_voice(filepath):
     return payload
 
 def _find_fish_voice_file(name):
-    _ensure_voices_dir()
-    if os.path.exists(name) and name.endswith('.ttse'):
-        return name
-    name = name.lower()
-    matches = []
-    for f in os.listdir(VOICES_DIR):
-        if not f.endswith('.ttse'):
-            continue
-        if f.startswith(f"voder_ttse_{name}_"):
-            matches.append(os.path.join(VOICES_DIR, f))
-    if not matches:
-        return None
-    matches.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-    return matches[0]
+    """Find an enhanced (.ttse) saved voice by name."""
+    return _voice_lib.find_voice(name, kind=_voice_lib.KIND_ENHANCED)
 
 def _is_fish_voice_ref(value):
-    if os.path.exists(value) and value.endswith('.ttse'):
-        return True
-    if _find_fish_voice_file(value.lower()) is not None:
-        return True
-    if ':' in value:
-        parts = value.split(':', 1)
-        second = parts[1].strip()
-        if second.endswith('.ttse'):
-            if os.path.exists(second):
-                return True
-            if _find_fish_voice_file(second.lower()) is not None:
-                return True
-        if _find_fish_voice_file(second.lower()) is not None:
-            return True
-    return False
+    path = _voice_lib.resolve_voice(value, prefer_enhanced=True)
+    return bool(path) and path.lower().endswith('.ttse')
 
 def _resolve_fish_voice_ref(value):
-    if ':' not in value:
-        voice_file = _find_fish_voice_file(value.lower())
-        if voice_file:
-            return voice_file
-        return None
-    parts = value.split(':', 1)
-    first = parts[0].strip()
-    second = parts[1].strip().lower()
-    if second.endswith('.ttse'):
-        if os.path.exists(second):
-            return second
-        voice_file = _find_fish_voice_file(second)
-        if voice_file:
-            return voice_file
-        return None
-    voice_file = _find_fish_voice_file(second)
-    if voice_file:
-        return voice_file
+    path = _voice_lib.resolve_voice(value, prefer_enhanced=True)
+    if path and path.lower().endswith('.ttse'):
+        return path
     return None
 
 def _check_voice_extreme_mismatch(voice_path, use_extreme):
@@ -7934,7 +7853,7 @@ def oneline_tts(params):
         target_voice_path = None
         if sts_target:
             sts_ref_raw = svc_target[4:]
-            trained_file = _resolve_voice_ref(sts_ref_raw)
+            trained_file = _resolve_voice_ref(sts_ref_raw, use_extreme=use_extreme)
             if trained_file:
                 if _check_voice_extreme_mismatch(trained_file, use_extreme):
                     return False
@@ -8017,7 +7936,7 @@ def oneline_tts(params):
                                 pass
                     return False
         else:
-            trained_file = _resolve_voice_ref(svc_target)
+            trained_file = _resolve_voice_ref(svc_target, use_extreme=use_extreme)
             if trained_file:
                 if _check_voice_extreme_mismatch(trained_file, use_extreme):
                     return False
@@ -8362,7 +8281,7 @@ def oneline_tts(params):
             return False
         if voices:
             voice_value = voices[0]
-            trained_file = _resolve_voice_ref(voice_value)
+            trained_file = _resolve_voice_ref(voice_value, use_extreme=use_extreme)
             if trained_file:
                 if _check_voice_extreme_mismatch(trained_file, use_extreme):
                     return False
@@ -8615,7 +8534,7 @@ def oneline_tts(params):
             if not char or not prompt:
                 print(f"Error: Empty character or prompt in voice: {v}")
                 return False
-            trained_file = _resolve_voice_ref(prompt)
+            trained_file = _resolve_voice_ref(prompt, use_extreme=use_extreme)
             if trained_file:
                 trained_voice_refs[char.lower()] = trained_file
             else:

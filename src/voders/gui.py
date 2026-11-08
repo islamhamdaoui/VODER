@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QListWidget, QListWidgetItem, QLineEdit,
                              QSpinBox, QScrollArea, QCheckBox, QRadioButton,
                              QStackedWidget, QDoubleSpinBox, QShortcut, QSlider,
-                             QSizePolicy, QGridLayout)
+                             QSizePolicy, QGridLayout, QInputDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt5.QtGui import QColor, QPainter, QPalette, QKeySequence, QFont
 
@@ -37,6 +37,12 @@ except Exception:
 _src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
+
+# VODER lives in <repo>/app/src; the repo folder is where voices/ and results/
+# are kept by the launcher (voder.bat), so always use it as the working folder.
+VODER_ROOT = os.path.dirname(os.path.dirname(_src_dir))
+
+from voders import voice_library as vlib
 
 THEME = {
     'background': '#0D0D0D',
@@ -459,7 +465,7 @@ class SubprocessThread(QThread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                cwd=_src_dir,
+                cwd=VODER_ROOT,
                 bufsize=1
             )
             output_lines = []
@@ -1633,6 +1639,540 @@ class FileListWidget(QWidget):
         self.list_widget.clear()
 
 
+VOICE_SOURCE_SAVED = "My saved voices (pick by name)"
+VOICE_SOURCE_DESCRIBE = "AI voice description (create a voice style)"
+VOICE_SOURCE_FILE = "Audio reference file (one-off)"
+
+
+class SavedVoicePickerRow(QWidget):
+    """One line: character name + a dropdown of the saved voices on this PC."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, show_character=True, allow_file=False, parent=None):
+        super().__init__(parent)
+        self.show_character = show_character
+        self.allow_file = allow_file
+        self._expect_enhanced = False
+        self._file_path = ""
+        self._building = False
+        self._previous_index = 0
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.char_edit = None
+        if show_character:
+            self.char_edit = QLineEdit()
+            self.char_edit.setPlaceholderText("Character")
+            self.char_edit.setStyleSheet(get_line_edit_style())
+            self.char_edit.setFixedWidth(120)
+            self.char_edit.setToolTip("Name used in the script for this voice")
+            self.char_edit.textChanged.connect(self._emit_changed)
+            layout.addWidget(self.char_edit)
+
+        self.combo = QComboBox()
+        self.combo.setStyleSheet(get_combo_box_style())
+        self.combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.combo.setToolTip("Pick one of your saved voice clones")
+        self.combo.activated[int].connect(self._on_activated)
+        self.combo.currentIndexChanged.connect(self._on_index_changed)
+        layout.addWidget(self.combo, stretch=1)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet(f"color: {THEME['text_secondary']}; font-size: 11px;")
+        self.status_label.setMinimumWidth(150)
+        layout.addWidget(self.status_label)
+
+        self.refresh()
+
+    # ------------------------------------------------------------------ data
+    def refresh(self):
+        current = self.current_value()
+        self._building = True
+        self.combo.clear()
+        self.combo.addItem("— pick a saved voice —", None)
+
+        groups = vlib.group_voices()
+        for key in sorted(groups, key=lambda k: groups[k]["name"].casefold()):
+            group = groups[key]
+            kinds = group["kinds"]
+            if vlib.KIND_STANDARD in kinds and vlib.KIND_ENHANCED in kinds:
+                tag = "Standard + Enhanced"
+            elif vlib.KIND_ENHANCED in kinds:
+                tag = "Enhanced"
+            else:
+                tag = "Standard"
+            name = group["name"]
+            display = name[:1].upper() + name[1:]
+            self.combo.addItem(f"{display}  ·  {tag}", ("saved", name))
+
+        if self._file_path:
+            self.combo.addItem(
+                f"Audio file · {os.path.basename(self._file_path)}",
+                ("file", self._file_path),
+            )
+        if self.allow_file:
+            self.combo.addItem("Browse for an audio file…", ("browse", None))
+        self._building = False
+
+        if current:
+            self.set_value(current)
+        else:
+            self.combo.setCurrentIndex(0)
+        self._update_status()
+
+    def current_value(self):
+        data = self.combo.currentData()
+        if isinstance(data, tuple) and len(data) == 2 and data[0] in ("saved", "file"):
+            return data[1] or ""
+        return ""
+
+    def current_name(self):
+        data = self.combo.currentData()
+        if isinstance(data, tuple) and data[0] == "saved":
+            return data[1] or ""
+        return ""
+
+    def set_value(self, value):
+        if not value:
+            self.combo.setCurrentIndex(0)
+            self._update_status()
+            return False
+        for index in range(self.combo.count()):
+            data = self.combo.itemData(index)
+            if not isinstance(data, tuple):
+                continue
+            if data[0] == "saved" and data[1].casefold() == value.casefold():
+                self.combo.setCurrentIndex(index)
+                self._update_status()
+                return True
+            if data[0] == "file" and data[1] == value:
+                self.combo.setCurrentIndex(index)
+                self._update_status()
+                return True
+        if self.allow_file and os.path.isfile(value):
+            self.set_file(value)
+            return True
+        return False
+
+    def set_file(self, path):
+        self._file_path = path
+        self.refresh()
+        for index in range(self.combo.count()):
+            data = self.combo.itemData(index)
+            if isinstance(data, tuple) and data[0] == "file" and data[1] == path:
+                self.combo.setCurrentIndex(index)
+                break
+        self._update_status()
+
+    def set_expect_enhanced(self, enhanced):
+        self._expect_enhanced = bool(enhanced)
+        self._update_status()
+
+    # --------------------------------------------------------------- events
+    def _on_activated(self, index):
+        if self._building:
+            return
+        data = self.combo.itemData(index)
+        if isinstance(data, tuple) and data[0] == "browse":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select audio reference", "",
+                "Audio Files (*.wav *.mp3 *.flac *.ogg);;Video Files (*.mp4 *.avi *.mov *.mkv);;All Files (*)"
+            )
+            if path:
+                self.set_file(path)
+                self.changed.emit()
+            else:
+                self.combo.setCurrentIndex(self._previous_index)
+            return
+        self._previous_index = index
+        self._after_user_pick()
+
+    def _on_index_changed(self, *_args):
+        if self._building:
+            return
+        self._update_status()
+
+    def _after_user_pick(self):
+        name = self.current_name()
+        if name and self.char_edit is not None:
+            if not self.char_edit.text().strip():
+                self.char_edit.setText(name)
+        self._update_status()
+        self.changed.emit()
+
+    def _emit_changed(self, *_args):
+        self.changed.emit()
+
+    def _update_status(self):
+        value = self.current_value()
+        data = self.combo.currentData()
+        if not value:
+            self.status_label.setText("")
+            self.combo.setToolTip("Pick one of the saved voices, or train a new one in Make Voice.")
+            return
+
+        if isinstance(data, tuple) and data[0] == "file":
+            self.status_label.setText("Audio file")
+            self.status_label.setStyleSheet(
+                f"color: {THEME['text_secondary']}; font-size: 11px;"
+            )
+            self.combo.setToolTip(value)
+            return
+
+        profiles = vlib.profiles_for_name(value)
+        kinds = {profile.kind for profile in profiles}
+        self.combo.setToolTip("\n".join(
+            f"{profile.kind_label}: {profile.path}" for profile in profiles
+        ))
+        if self._expect_enhanced:
+            if vlib.KIND_ENHANCED in kinds:
+                text, color = "Enhanced ready", THEME["accent"]
+            else:
+                text, color = "Standard only - untick Enhanced", THEME["warning"]
+        else:
+            if vlib.KIND_STANDARD in kinds:
+                text, color = "Ready", THEME["accent"]
+            elif vlib.KIND_ENHANCED in kinds:
+                text, color = "Enhanced only - tick Enhanced", THEME["warning"]
+            else:
+                text, color = "", THEME["text_secondary"]
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+
+class CharacterVoiceList(QWidget):
+    """A list of character/voice rows backed by the persistent voice library."""
+
+    changed = pyqtSignal()
+    train_requested = pyqtSignal()
+
+    def __init__(self, allow_file=False, show_character=True, parent=None):
+        super().__init__(parent)
+        self.allow_file = allow_file
+        self.show_character = show_character
+        self.rows = []
+        self._expect_enhanced = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        self.count_label = QLabel("Saved voices")
+        self.count_label.setStyleSheet(f"color: {THEME['text']}; font-size: 12px; font-weight: bold;")
+        header.addWidget(self.count_label)
+        header.addStretch()
+
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setStyleSheet(get_surface_button_style())
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.refresh_btn.setFixedHeight(26)
+        self.refresh_btn.clicked.connect(self.refresh)
+        header.addWidget(self.refresh_btn)
+
+        self.open_btn = QPushButton("Open Folder")
+        self.open_btn.setStyleSheet(get_surface_button_style())
+        self.open_btn.setCursor(Qt.PointingHandCursor)
+        self.open_btn.setFixedHeight(26)
+        self.open_btn.clicked.connect(vlib.open_voices_folder)
+        header.addWidget(self.open_btn)
+
+        self.train_btn = QPushButton("+ Train New")
+        self.train_btn.setStyleSheet(get_surface_button_style())
+        self.train_btn.setCursor(Qt.PointingHandCursor)
+        self.train_btn.setFixedHeight(26)
+        self.train_btn.clicked.connect(self.train_requested.emit)
+        header.addWidget(self.train_btn)
+        layout.addLayout(header)
+
+        self.rows_layout = QVBoxLayout()
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(4)
+        layout.addLayout(self.rows_layout)
+
+        self.hint_label = QLabel("")
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setStyleSheet(
+            f"color: {THEME['text_secondary']}; font-size: 11px; padding: 2px 0;"
+        )
+        layout.addWidget(self.hint_label)
+
+        self.ensure_row()
+        self.refresh()
+
+    def ensure_row(self, character=""):
+        row = SavedVoicePickerRow(show_character=self.show_character,
+                                  allow_file=self.allow_file)
+        row.changed.connect(self._on_row_changed)
+        if character and row.char_edit is not None:
+            row.char_edit.setText(character)
+        self.rows_layout.addWidget(row)
+        self.rows.append(row)
+        return row
+
+    def ensure_characters(self, characters):
+        groups = vlib.group_voices()
+        existing = {
+            row.char_edit.text().strip().casefold()
+            for row in self.rows if row.char_edit is not None
+        }
+        for character in sorted({c.strip() for c in characters if c and c.strip()}):
+            key = character.casefold()
+            if key in existing:
+                continue
+            row = self.ensure_row(character)
+            existing.add(key)
+            group = groups.get(key)
+            if group is not None:
+                row.set_value(group["name"])
+
+    def refresh(self):
+        voices = vlib.list_voices()
+        names = {voice.name.casefold() for voice in voices}
+        if names:
+            self.count_label.setText(
+                f"{len(names)} saved voice{'s' if len(names) != 1 else ''} found"
+            )
+        else:
+            self.count_label.setText("No saved voices yet")
+        for row in self.rows:
+            row.refresh()
+            row.set_expect_enhanced(self._expect_enhanced)
+        self._update_hint()
+
+    def _update_hint(self):
+        voices = vlib.list_voices()
+        names = len({voice.name.casefold() for voice in voices})
+        if not names:
+            self.hint_label.setText(
+                "No saved voices yet. Train one in Make Voice, then it appears here "
+                "automatically - even after you restart your PC."
+            )
+        else:
+            self.hint_label.setText(
+                "Pick a voice per character. Names are remembered on this PC, so you "
+                "never need to paste a link or file path. A character whose name "
+                "matches a saved voice is filled in automatically."
+            )
+        self.hint_label.setToolTip(vlib.voices_dir())
+
+    def set_expect_enhanced(self, enhanced):
+        self._expect_enhanced = bool(enhanced)
+        for row in self.rows:
+            row.set_expect_enhanced(self._expect_enhanced)
+        self._update_hint()
+
+    def get_items(self):
+        items = []
+        for row in self.rows:
+            value = row.current_value()
+            if not value:
+                continue
+            character = ""
+            if row.char_edit is not None:
+                character = row.char_edit.text().strip()
+            items.append((character, value))
+        return items
+
+    def select_saved_voice(self, name):
+        target = None
+        for row in self.rows:
+            if row.char_edit is not None and row.char_edit.text().strip().casefold() == name.casefold():
+                target = row
+                break
+        if target is None:
+            for row in self.rows:
+                if not row.current_value():
+                    target = row
+                    break
+        if target is None and self.rows:
+            target = self.rows[0]
+        if target is None:
+            target = self.ensure_row()
+        if target.char_edit is not None and not target.char_edit.text().strip():
+            target.char_edit.setText(name)
+        target.set_value(name)
+        self._on_row_changed()
+
+    def _on_row_changed(self):
+        self._update_hint()
+        self.changed.emit()
+
+
+class VoiceLibraryPanel(QWidget):
+    """List of the saved voices with rename / delete / use actions."""
+
+    use_voice = pyqtSignal(str)
+    voices_changed = pyqtSignal()
+    train_requested = pyqtSignal()
+
+    def __init__(self, show_train_button=True, parent=None):
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.count_label = QLabel("Saved voices")
+        self.count_label.setStyleSheet(
+            f"color: {THEME['text']}; font-size: 13px; font-weight: bold;"
+        )
+        layout.addWidget(self.count_label)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet(get_list_widget_style())
+        self.list_widget.setMinimumHeight(160)
+        self.list_widget.itemDoubleClicked.connect(lambda *_: self.emit_use())
+        layout.addWidget(self.list_widget)
+
+        self.folder_label = QLabel(f"Folder: {vlib.voices_dir()}")
+        self.folder_label.setWordWrap(True)
+        self.folder_label.setStyleSheet(
+            f"color: {THEME['text_secondary']}; font-size: 11px;"
+        )
+        layout.addWidget(self.folder_label)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(6)
+        for text, slot in (
+            ("Refresh", self.refresh),
+            ("Open Folder", vlib.open_voices_folder),
+            ("Rename", self.rename_selected),
+            ("Delete", self.delete_selected),
+            ("Use in Speech", self.emit_use),
+        ):
+            button = QPushButton(text)
+            button.setStyleSheet(get_surface_button_style())
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(slot)
+            button_row.addWidget(button)
+        if show_train_button:
+            train_btn = QPushButton("Train New Voice")
+            train_btn.setStyleSheet(get_main_button_style())
+            train_btn.setCursor(Qt.PointingHandCursor)
+            train_btn.clicked.connect(self.train_requested.emit)
+            button_row.addWidget(train_btn)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+        self.refresh()
+
+    def refresh(self):
+        selected_path = self._selected_path()
+        self.list_widget.clear()
+        voices = vlib.list_voices()
+        groups = vlib.group_voices(voices)
+        for key in sorted(groups, key=lambda k: groups[k]["name"].casefold()):
+            group = groups[key]
+            kinds = group["kinds"]
+            if vlib.KIND_STANDARD in kinds and vlib.KIND_ENHANCED in kinds:
+                tag = "Standard + Enhanced"
+            elif vlib.KIND_ENHANCED in kinds:
+                tag = "Enhanced"
+            else:
+                tag = "Standard"
+            newest = max(group["profiles"], key=lambda p: p.modified)
+            try:
+                stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest.modified))
+            except Exception:
+                stamp = ""
+            display = newest.display_name
+            item = QListWidgetItem(f"{display}   ·   {tag}   ·   {stamp}")
+            item.setData(Qt.UserRole, newest.path)
+            item.setToolTip("\n".join(f"{p.kind_label}: {p.path}" for p in group["profiles"]))
+            self.list_widget.addItem(item)
+            if selected_path and os.path.normcase(newest.path) == os.path.normcase(selected_path):
+                self.list_widget.setCurrentItem(item)
+
+        names = len({voice.name.casefold() for voice in voices})
+        if names:
+            self.count_label.setText(
+                f"{names} saved voice{'s' if names != 1 else ''} - double-click to use"
+            )
+        else:
+            self.count_label.setText("No saved voices yet - train one below")
+
+    def _selected_path(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return ""
+        return item.data(Qt.UserRole) or ""
+
+    def _selected_name(self):
+        path = self._selected_path()
+        if not path:
+            return ""
+        for profile in vlib.list_voices():
+            if os.path.normcase(profile.path) == os.path.normcase(path):
+                return profile.name
+        return ""
+
+    def emit_use(self):
+        name = self._selected_name()
+        if not name:
+            QMessageBox.information(self, "Pick a voice", "Select a saved voice first.")
+            return
+        self.use_voice.emit(name)
+
+    def rename_selected(self):
+        path = self._selected_path()
+        if not path:
+            QMessageBox.information(self, "Pick a voice", "Select a saved voice first.")
+            return
+        current = self._selected_name()
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Voice", "New voice name (this is the name you will pick later):",
+            text=current
+        )
+        if not ok:
+            return
+        profiles = vlib.profiles_for_name(current) or [
+            p for p in vlib.list_voices() if os.path.normcase(p.path) == os.path.normcase(path)
+        ]
+        renamed = 0
+        for profile in profiles:
+            if vlib.rename_voice(profile.path, new_name):
+                renamed += 1
+        if not renamed:
+            QMessageBox.warning(
+                self, "Rename failed",
+                "That name is empty, unsafe, or already used by another copy of this voice."
+            )
+            return
+        self.refresh()
+        self.voices_changed.emit()
+
+    def delete_selected(self):
+        path = self._selected_path()
+        if not path:
+            QMessageBox.information(self, "Pick a voice", "Select a saved voice first.")
+            return
+        name = self._selected_name()
+        profiles = vlib.profiles_for_name(name) or [
+            p for p in vlib.list_voices() if os.path.normcase(p.path) == os.path.normcase(path)
+        ]
+        extra = ""
+        if len(profiles) > 1:
+            extra = f"\n\nThis deletes {len(profiles)} files (standard and enhanced versions)."
+        answer = QMessageBox.question(
+            self, "Delete voice",
+            f"Delete the saved voice '{name}'?{extra}\n\n{path}\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer != QMessageBox.Yes:
+            return
+        deleted = sum(1 for profile in profiles if vlib.delete_voice(profile.path))
+        if not deleted:
+            QMessageBox.warning(self, "Delete failed", "The voice file could not be deleted.")
+            return
+        self.refresh()
+        self.voices_changed.emit()
+
+
 class StemSelectorWidget(QWidget):
     stems_changed = pyqtSignal()
 
@@ -1763,6 +2303,7 @@ class StemSelectorWidget(QWidget):
 class TTSTab(QWidget):
     run_signal = pyqtSignal(list)
     transcribe_signal = pyqtSignal(list)
+    train_voice_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1809,10 +2350,31 @@ class TTSTab(QWidget):
         self.run_btn.setCursor(Qt.PointingHandCursor)
         self.run_btn.clicked.connect(self.on_run)
         self.inner.addWidget(self.run_btn)
+
+        self.tts_status_label = QLabel("Ready — choose a voice source, enter text, then click Run Speech.")
+        self.tts_status_label.setWordWrap(True)
+        self.tts_status_label.setStyleSheet(
+            f"color: {THEME['text_secondary']}; font-size: 12px; padding: 4px 2px;"
+        )
+        self.inner.addWidget(self.tts_status_label)
         self.inner.addStretch()
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
         self.on_submode_changed("Speech")
+
+    def set_generation_status(self, message, success=None):
+        if not hasattr(self, "tts_status_label"):
+            return
+        self.tts_status_label.setText(message)
+        if success is True:
+            color = THEME.get("success", THEME["accent"])
+        elif success is False:
+            color = THEME.get("error", "#e05b5b")
+        else:
+            color = THEME["text_secondary"]
+        self.tts_status_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; padding: 4px 2px;"
+        )
 
     def clear_container(self):
         while self.container_layout.count():
@@ -1831,6 +2393,10 @@ class TTSTab(QWidget):
         self.clear_container()
         if mode == "Speech":
             self.build_tts_ui()
+            pending = getattr(self, "_pending_adopt_name", "")
+            if pending:
+                self._pending_adopt_name = ""
+                self.tts_saved_voices.select_saved_voice(pending)
         elif mode == "Modify Speech":
             self.build_modify_speech_ui()
         elif mode == "Language Convert":
@@ -1900,22 +2466,82 @@ class TTSTab(QWidget):
         self.tts_mode_single.toggled.connect(self._on_tts_mode_changed)
         self.tts_dialogue_widget.characters_changed.connect(self._on_characters_changed)
 
-        HelperWidgets.make_label(self.container_layout, "Voice Prompts (Character: description)")
-        self.tts_voice_list = KeyValueList("Character", "Voice Prompt", "Character name", "e.g. deep male voice")
+        HelperWidgets.make_separator(self.container_layout)
+        HelperWidgets.make_label(self.container_layout, "VOICE SOURCE — choose ONE")
+        self.tts_voice_source = QComboBox()
+        self.tts_voice_source.setStyleSheet(get_combo_box_style())
+        sources = [VOICE_SOURCE_SAVED, VOICE_SOURCE_DESCRIBE, VOICE_SOURCE_FILE]
+        if not vlib.list_voices():
+            # Nothing trained yet: start on the description so the user is not
+            # staring at an empty picker.
+            sources = [VOICE_SOURCE_DESCRIBE, VOICE_SOURCE_SAVED, VOICE_SOURCE_FILE]
+        self.tts_voice_source.addItems(sources)
+        self.tts_voice_source.setToolTip(
+            "Saved voices are picked from a list. You never need to paste a path or link."
+        )
+        self.container_layout.addWidget(self.tts_voice_source)
+
+        self.tts_voice_help = QLabel("")
+        self.tts_voice_help.setWordWrap(True)
+        self.tts_voice_help.setStyleSheet(
+            f"color: {THEME['text_secondary']}; font-size: 12px; padding: 2px 4px;"
+        )
+        self.container_layout.addWidget(self.tts_voice_help)
+
+        # --- Saved voice clones (the everyday path) ---------------------
+        self.tts_saved_container = QWidget()
+        self.tts_saved_container.setStyleSheet("background: transparent;")
+        saved_layout = QVBoxLayout(self.tts_saved_container)
+        saved_layout.setContentsMargins(0, 0, 0, 0)
+        saved_layout.setSpacing(4)
+        self.tts_saved_voices = CharacterVoiceList(allow_file=False, show_character=True)
+        self.tts_saved_voices.train_requested.connect(self.train_voice_requested.emit)
+        self.tts_saved_voices.set_expect_enhanced(self.extreme_cb.isChecked())
+        saved_layout.addWidget(self.tts_saved_voices)
+        self.container_layout.addWidget(self.tts_saved_container)
+
+        # --- AI voice description ---------------------------------------
+        self.tts_description_container = QWidget()
+        self.tts_description_container.setStyleSheet("background: transparent;")
+        desc_layout = QVBoxLayout(self.tts_description_container)
+        desc_layout.setContentsMargins(0, 0, 0, 0)
+        desc_layout.setSpacing(4)
+        self.tts_voice_prompt_label = QLabel("AI voice description (per character)")
+        self.tts_voice_prompt_label.setStyleSheet(f"color: {THEME['text']}; font-size: 13px;")
+        desc_layout.addWidget(self.tts_voice_prompt_label)
+        self.tts_voice_list = KeyValueList(
+            "Character", "Voice Description", "Character name", "e.g. warm, friendly female voice"
+        )
         self.tts_voice_list.setMinimumHeight(80)
         self.tts_voice_list.add_btn.hide()
-        self.container_layout.addWidget(self.tts_voice_list)
+        desc_layout.addWidget(self.tts_voice_list)
+        self.container_layout.addWidget(self.tts_description_container)
 
-        HelperWidgets.make_separator(self.container_layout)
-        HelperWidgets.make_label(self.container_layout, "Voice References (Character: audio path)")
-        self.tts_clone_list = KeyValueList("Character", "Audio Path", "Character name", "path/to/voice.wav", with_browse=True)
+        # --- One-off audio reference ------------------------------------
+        self.tts_reference_container = QWidget()
+        self.tts_reference_container.setStyleSheet("background: transparent;")
+        ref_layout = QVBoxLayout(self.tts_reference_container)
+        ref_layout.setContentsMargins(0, 0, 0, 0)
+        ref_layout.setSpacing(4)
+        self.tts_reference_label = QLabel("Audio reference (per character)")
+        self.tts_reference_label.setStyleSheet(f"color: {THEME['text']}; font-size: 13px;")
+        ref_layout.addWidget(self.tts_reference_label)
+        self.tts_clone_list = KeyValueList(
+            "Character", "Audio Reference", "Character name", "path/to/voice.wav", with_browse=True
+        )
         self.tts_clone_list.setMinimumHeight(80)
         self.tts_clone_list.add_btn.hide()
-        self.container_layout.addWidget(self.tts_clone_list)
+        ref_layout.addWidget(self.tts_clone_list)
+        self.container_layout.addWidget(self.tts_reference_container)
+
+        self.tts_voice_source.currentTextChanged.connect(self._on_voice_source_changed)
+        self._on_voice_source_changed(self.tts_voice_source.currentText())
 
         self.tts_first_cb = HelperWidgets.make_checkbox(self.container_layout, "Use First as Speaker Template")
 
         self.tts_sts_prefix_cb = HelperWidgets.make_checkbox(self.container_layout, "Voice Refinement Pass (route target through voice conversion)")
+
+        self._on_voice_source_changed(self.tts_voice_source.currentText())
 
         HelperWidgets.make_separator(self.container_layout)
         self.tts_music_edit = HelperWidgets.make_line_edit(self.container_layout, "Music Desc", "Background music description (dialogue mode)")
@@ -1937,9 +2563,14 @@ class TTSTab(QWidget):
         self.ms_script_text.setMinimumHeight(120)
         self.ms_script_text.setMaximumHeight(240)
         self.container_layout.addWidget(self.ms_script_text)
-        self.ms_target_audio = AudioReferenceWidget("Voice Reference", file_filter="Audio Files (*.wav *.mp3 *.flac *.ogg);;All Files (*)")
+        HelperWidgets.make_label(self.container_layout, "Voice Target — pick a saved voice, or use a reference file")
+        self.ms_saved_voice = SavedVoicePickerRow(show_character=False, allow_file=False)
+        self.container_layout.addWidget(self.ms_saved_voice)
+        self.ms_target_audio = AudioReferenceWidget("Voice Reference (optional)", file_filter="Audio Files (*.wav *.mp3 *.flac *.ogg);;All Files (*)")
         self.container_layout.addWidget(self.ms_target_audio)
         self.ms_extreme_cb = HelperWidgets.make_checkbox(self.container_layout, "Enhanced Synthesis (Fish Speech S2Pro)")
+        self.ms_extreme_cb.stateChanged.connect(self._update_voice_mode_hints)
+        self.ms_saved_voice.set_expect_enhanced(self.ms_extreme_cb.isChecked())
         self.ms_preserve_cb = HelperWidgets.make_checkbox(self.container_layout, "Preserve non-vocals (keep music/instruments)")
         ms_btn_row = QHBoxLayout()
         self.ms_transcribe_btn = QPushButton("Transcribe")
@@ -1985,11 +2616,15 @@ class TTSTab(QWidget):
     def build_svc_ui(self):
         self.svc_input_audio = AudioReferenceWidget("Source Audio", file_filter="Audio Files (*.wav *.mp3 *.flac *.ogg);;Video Files (*.mp4 *.avi *.mov *.mkv);;All Files (*)")
         self.container_layout.addWidget(self.svc_input_audio)
-        HelperWidgets.make_label(self.container_layout, "Voice Target (use one):")
-        self.svc_target_audio = AudioReferenceWidget("Voice Reference", file_filter="Audio Files (*.wav *.mp3 *.flac *.ogg);;All Files (*)")
+        HelperWidgets.make_label(self.container_layout, "Voice Target — pick a saved voice, or use a reference file / description")
+        self.svc_saved_voice = SavedVoicePickerRow(show_character=False, allow_file=False)
+        self.container_layout.addWidget(self.svc_saved_voice)
+        self.svc_target_audio = AudioReferenceWidget("Voice Reference (optional)", file_filter="Audio Files (*.wav *.mp3 *.flac *.ogg);;All Files (*)")
         self.container_layout.addWidget(self.svc_target_audio)
         self.svc_voice_edit = HelperWidgets.make_line_edit(self.container_layout, "Voice Desc", "e.g. deep male voice (alternative to reference file)")
         self.svc_extreme_cb = HelperWidgets.make_checkbox(self.container_layout, "Enhanced Synthesis (Fish Speech S2Pro)")
+        self.svc_extreme_cb.stateChanged.connect(self._update_voice_mode_hints)
+        self.svc_saved_voice.set_expect_enhanced(self.svc_extreme_cb.isChecked())
 
     def build_dub_ui(self):
         self.dub_source_audio = AudioReferenceWidget("Source Video/Audio", file_filter="Video Files (*.mp4 *.avi *.mov *.mkv);;Audio Files (*.wav *.mp3 *.flac *.ogg);;All Files (*)")
@@ -2045,7 +2680,95 @@ class TTSTab(QWidget):
     def _on_characters_changed(self, chars):
         self.tts_voice_list.ensure_keys(chars)
         self.tts_clone_list.ensure_keys(chars)
+        if hasattr(self, "tts_saved_voices"):
+            self.tts_saved_voices.ensure_characters(chars)
         self._update_timeline()
+
+    def _on_voice_source_changed(self, selection):
+        """Show only the selected voice source so the fields are not confusing."""
+        use_saved = selection.startswith(VOICE_SOURCE_SAVED)
+        use_description = selection.startswith(VOICE_SOURCE_DESCRIBE)
+        use_reference = selection.startswith(VOICE_SOURCE_FILE)
+
+        self.tts_saved_container.setVisible(use_saved)
+        self.tts_description_container.setVisible(use_description)
+        self.tts_reference_container.setVisible(use_reference)
+        if hasattr(self, "tts_first_cb"):
+            self.tts_first_cb.setVisible(use_reference)
+            self.tts_sts_prefix_cb.setVisible(use_reference)
+
+        if use_saved:
+            count = len({v.name.casefold() for v in vlib.list_voices()})
+            if count:
+                self.tts_voice_help.setText(
+                    f"Pick one of your {count} saved voice{'s' if count != 1 else ''} by "
+                    "name. Every character can use a different saved voice."
+                )
+            else:
+                self.tts_voice_help.setText(
+                    "You have no saved voices yet. Click '+ Train New' above (or use the "
+                    "Make Voice tab), then the voice appears here automatically."
+                )
+        elif use_description:
+            self.tts_voice_help.setText(
+                "Describe the voice you want, e.g. warm, friendly female voice. "
+                "This creates a voice style; it does NOT load a saved clone."
+            )
+        else:
+            self.tts_voice_help.setText(
+                "Choose a clean WAV/MP3 sample of the voice to use as a one-off "
+                "reference. This is not a saved VODER voice profile."
+            )
+
+    def refresh_voice_library(self):
+        """Re-scan the voices folder after training, renaming or deleting."""
+        try:
+            if hasattr(self, "tts_saved_voices"):
+                self.tts_saved_voices.refresh()
+            if self.sub_mode.currentText() == "Speech":
+                self._on_voice_source_changed(self.tts_voice_source.currentText())
+        except RuntimeError:
+            # The current sub-mode was rebuilt and a stale widget is gone.
+            pass
+
+    def _update_voice_mode_hints(self):
+        enhanced = self.extreme_cb.isChecked()
+        try:
+            if hasattr(self, "tts_saved_voices"):
+                self.tts_saved_voices.set_expect_enhanced(enhanced)
+        except RuntimeError:
+            pass
+        try:
+            if hasattr(self, "ms_saved_voice"):
+                self.ms_saved_voice.set_expect_enhanced(
+                    self.ms_extreme_cb.isChecked() if hasattr(self, "ms_extreme_cb") else enhanced
+                )
+        except RuntimeError:
+            pass
+        try:
+            if hasattr(self, "svc_saved_voice"):
+                self.svc_saved_voice.set_expect_enhanced(
+                    self.svc_extreme_cb.isChecked() if hasattr(self, "svc_extreme_cb") else enhanced
+                )
+        except RuntimeError:
+            pass
+
+    def adopt_saved_voice(self, name):
+        """Called from the Voice Library: switch to saved voices and pick one."""
+        if not name:
+            return
+        if self.sub_mode.currentText() != "Speech":
+            # Speech UI is not built right now; remember it for later.
+            self._pending_adopt_name = name
+            return
+        try:
+            index = self.tts_voice_source.findText(VOICE_SOURCE_SAVED)
+            if index >= 0:
+                self.tts_voice_source.setCurrentIndex(index)
+            self.tts_saved_voices.select_saved_voice(name)
+            self._on_voice_source_changed(self.tts_voice_source.currentText())
+        except RuntimeError:
+            self._pending_adopt_name = name
 
     def _update_timeline(self):
         if hasattr(self, 'tts_dialogue_widget') and hasattr(self, 'timeline_widget'):
@@ -2088,20 +2811,68 @@ class TTSTab(QWidget):
                         script += f" {directives}"
                     args.extend(["script", script])
 
-            if hasattr(self, 'tts_voice_list'):
-                for char, desc in self.tts_voice_list.get_items():
+            voice_source = self.tts_voice_source.currentText() if hasattr(self, 'tts_voice_source') else VOICE_SOURCE_DESCRIBE
+            if voice_source.startswith(VOICE_SOURCE_SAVED):
+                saved = []
+                for char, name in self.tts_saved_voices.get_items():
+                    char = (char or "").strip() or name
+                    if name:
+                        saved.append((char, name))
+                if not is_dialogue:
+                    # Single = one speaker: ignore any extra rows so the user
+                    # cannot accidentally build an invalid two-voice command.
+                    saved = saved[:1]
+                for char, name in saved:
+                    args.extend(["voice", f"{char}: {name}"])
+                # Single-speaker TTS treats a named voice as a dialogue prompt,
+                # so label the script with the character automatically.
+                if not is_dialogue and len(saved) == 1 and script:
+                    speaker = saved[0][0]
+                    script_arg_index = next((i + 1 for i, value in enumerate(args[:-1]) if value == "script"), None)
+                    if script_arg_index is not None:
+                        current_script = args[script_arg_index]
+                        if not current_script.lstrip().lower().startswith(speaker.lower() + ":"):
+                            args[script_arg_index] = f"{speaker}: {current_script}"
+            elif voice_source.startswith(VOICE_SOURCE_DESCRIBE):
+                voice_items = [(char.strip(), desc.strip()) for char, desc in self.tts_voice_list.get_items() if char.strip() and desc.strip()]
+                if not is_dialogue:
+                    voice_items = voice_items[:1]
+                for char, desc in voice_items:
                     args.extend(["voice", f"{char}: {desc}"])
-
-            if hasattr(self, 'tts_clone_list'):
+                # The CLI parses character-labelled scripts whenever a named
+                # voice prompt is supplied. Add the character automatically
+                # in Single mode so users never have to type "name:".
+                if not is_dialogue and len(voice_items) == 1 and script:
+                    speaker = voice_items[0][0]
+                    script_arg_index = next((i + 1 for i, value in enumerate(args[:-1]) if value == "script"), None)
+                    if script_arg_index is not None:
+                        current_script = args[script_arg_index]
+                        if not current_script.lstrip().lower().startswith(speaker.lower() + ":"):
+                            args[script_arg_index] = f"{speaker}: {current_script}"
+            elif voice_source.startswith(VOICE_SOURCE_FILE):
                 first_checked = hasattr(self, 'tts_first_cb') and self.tts_first_cb.isChecked()
-                for char, path in self.tts_clone_list.get_items():
-                    target_val = path
+                clone_items = [(char, path) for char, path in self.tts_clone_list.get_items() if path.strip()]
+                if not is_dialogue:
+                    clone_items = clone_items[:1]
+                used_speaker = ""
+                for char, path in clone_items:
+                    if not path.strip():
+                        continue
+                    char = (char or "").strip() or "Speaker"
+                    used_speaker = char
+                    target_val = path.strip()
                     if hasattr(self, 'tts_sts_prefix_cb') and self.tts_sts_prefix_cb.isChecked():
                         target_val = "sts:" + target_val
                     if first_checked:
                         args.extend(["target", "first", f"{char}: {target_val}"])
                     else:
                         args.extend(["target", f"{char}: {target_val}"])
+                if not is_dialogue and used_speaker and script:
+                    script_arg_index = next((i + 1 for i, value in enumerate(args[:-1]) if value == "script"), None)
+                    if script_arg_index is not None:
+                        current_script = args[script_arg_index]
+                        if not current_script.lstrip().lower().startswith(used_speaker.lower() + ":"):
+                            args[script_arg_index] = f"{used_speaker}: {current_script}"
 
             music = self.tts_music_edit.text().strip() if hasattr(self, 'tts_music_edit') else ""
             if music:
@@ -2119,13 +2890,21 @@ class TTSTab(QWidget):
             script = self.ms_script_text.toPlainText().strip() if hasattr(self, 'ms_script_text') else ""
             if not script:
                 return None
-            args.extend(["script", script])
+            saved = ""
+            if hasattr(self, 'ms_saved_voice'):
+                saved = self.ms_saved_voice.current_value().strip()
             target = self.ms_target_audio.get_path() if hasattr(self, 'ms_target_audio') else ""
             source = self.ms_source_audio.get_path() if hasattr(self, 'ms_source_audio') else ""
-            if target:
-                args.extend(["target", target])
-            elif source:
-                args.extend(["target", source])
+            if saved:
+                # Use the trained voice directly instead of a voice-conversion
+                # reference: the script must carry the speaker label.
+                args.extend(["script", f"{saved}: {script}"])
+                args.extend(["voice", f"{saved}: {saved}"])
+            else:
+                reference = target or source
+                args.extend(["script", f"Speaker: {script}"])
+                if reference:
+                    args.extend(["target", f"Speaker: {reference}"])
 
         elif mode == "Language Convert":
             input_path = self.slc_input_audio.get_path() if hasattr(self, 'slc_input_audio') else ""
@@ -2152,9 +2931,12 @@ class TTSTab(QWidget):
                 return None
             args.append("svc")
             args.append(input_path)
+            saved = self.svc_saved_voice.current_value().strip() if hasattr(self, 'svc_saved_voice') else ""
             target = self.svc_target_audio.get_path() if hasattr(self, 'svc_target_audio') else ""
             voice = self.svc_voice_edit.text().strip() if hasattr(self, 'svc_voice_edit') else ""
-            if target:
+            if saved:
+                args.extend(["target", saved])
+            elif target:
                 args.extend(["target", target])
             elif voice:
                 args.extend(["voice", voice])
@@ -3087,9 +3869,12 @@ class SSTab(QWidget):
 
 class TrainTab(QWidget):
     run_signal = pyqtSignal(list)
+    voices_changed = pyqtSignal()
+    use_voice_signal = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.pending_voice_name = ""
         self.setup_ui()
 
     def setup_ui(self):
@@ -3104,8 +3889,13 @@ class TrainTab(QWidget):
         inner = QVBoxLayout(scroll_widget)
         inner.setSpacing(8)
 
-        self.voice_name_edit = HelperWidgets.make_line_edit(inner, "Voice Name", "e.g. james, sarah (used for voice: lookup)")
-        HelperWidgets.make_label(inner, "Reference Audio Files (1 or more)")
+        HelperWidgets.make_label(inner, "CREATE A REUSABLE VOICE CLONE")
+        self.voice_name_edit = HelperWidgets.make_line_edit(inner, "Voice Name", "e.g. rym, despina, alice")
+        self.voice_name_edit.setToolTip(
+            "This is the name you will pick later in the Speech tab. "
+            "It is saved on this PC and stays after a restart."
+        )
+        HelperWidgets.make_label(inner, "Add one or more clean recordings of this voice (WAV, MP3, FLAC or OGG).")
         self.ref_list = FileListWidget(inner, file_filter="Audio (*.wav *.mp3 *.flac *.ogg);;All Files (*)")
         inner.addWidget(self.ref_list)
         self.test_cb = HelperWidgets.make_checkbox(inner, "Test after training")
@@ -3113,20 +3903,70 @@ class TrainTab(QWidget):
         self.first_cb = HelperWidgets.make_checkbox(inner, "Use First as Speaker Template")
         self.extreme_cb = HelperWidgets.make_checkbox(inner, "Enhanced Synthesis (train for .ttse file, Fish Speech S2Pro)")
 
-        self.run_btn = QPushButton("Run Make Voice")
+        self.save_info = QLabel(
+            "Your voice is saved as a file in the VODER voices folder and appears "
+            "automatically in Speech, Voice Change and Voice Library - even after you "
+            "restart your PC. No links or paths to remember."
+        )
+        self.save_info.setWordWrap(True)
+        self.save_info.setStyleSheet(
+            f"color: {THEME['text_secondary']}; font-size: 12px; padding: 4px 2px;"
+        )
+        inner.addWidget(self.save_info)
+
+        self.run_btn = QPushButton("Train & Save Voice Clone")
         self.run_btn.setStyleSheet(get_main_button_style())
         self.run_btn.setCursor(Qt.PointingHandCursor)
         self.run_btn.clicked.connect(self.on_run)
         inner.addWidget(self.run_btn)
+
+        self.train_status = QLabel("Ready — name your voice, add recordings, then train.")
+        self.train_status.setWordWrap(True)
+        self.train_status.setStyleSheet(
+            f"color: {THEME['text_secondary']}; font-size: 12px; padding: 2px;"
+        )
+        inner.addWidget(self.train_status)
+
+        HelperWidgets.make_separator(inner)
+        HelperWidgets.make_label(inner, "YOUR SAVED VOICES")
+        self.library_panel = VoiceLibraryPanel(show_train_button=False)
+        self.library_panel.use_voice.connect(self.use_voice_signal.emit)
+        self.library_panel.voices_changed.connect(self._on_voices_changed)
+        inner.addWidget(self.library_panel)
         inner.addStretch()
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
 
+    def refresh_voice_library(self):
+        if hasattr(self, "library_panel"):
+            self.library_panel.refresh()
+
+    def set_training_status(self, message, success=None):
+        if not hasattr(self, "train_status"):
+            return
+        if success is True:
+            color = THEME.get("success", THEME["accent"])
+        elif success is False:
+            color = THEME.get("error", "#e05b5b")
+        else:
+            color = THEME["text_secondary"]
+        self.train_status.setText(message)
+        self.train_status.setStyleSheet(f"color: {color}; font-size: 12px; padding: 2px;")
+
+    def _on_voices_changed(self):
+        self.refresh_voice_library()
+        self.voices_changed.emit()
+
     def build_args(self):
-        voice_name = self.voice_name_edit.text().strip()
+        voice_name = vlib.sanitize_voice_name(self.voice_name_edit.text())
         paths = self.ref_list.get_paths()
         if not voice_name or not paths:
             return None
+        if voice_name != self.voice_name_edit.text().strip():
+            # Keep the field and the saved file name in sync so the user can
+            # find the voice by the name shown after training.
+            self.voice_name_edit.setText(voice_name)
+        self.pending_voice_name = voice_name
         args = ["train"]
         if self.extreme_cb.isChecked():
             args.append("extreme")
@@ -3147,6 +3987,40 @@ class TrainTab(QWidget):
             self.run_signal.emit(args)
 
 
+class VoiceLibraryTab(QWidget):
+    use_voice_signal = pyqtSignal(str)
+    voices_changed = pyqtSignal()
+    train_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        HelperWidgets.make_label(layout, "SAVED VOICES ON THIS PC")
+        intro = QLabel(
+            "Every voice you train is kept here. Pick one by name in Speech, Voice "
+            "Change or Modify Speech - no links and no file paths needed. Voices stay "
+            "available after you restart the PC."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(
+            f"color: {THEME['text_secondary']}; font-size: 12px; padding: 2px;"
+        )
+        layout.addWidget(intro)
+        self.panel = VoiceLibraryPanel(show_train_button=True)
+        self.panel.use_voice.connect(self.use_voice_signal.emit)
+        self.panel.voices_changed.connect(self._on_voices_changed)
+        self.panel.train_requested.connect(self.train_requested.emit)
+        layout.addWidget(self.panel)
+
+    def refresh_voice_library(self):
+        self.panel.refresh()
+
+    def _on_voices_changed(self):
+        self.refresh_voice_library()
+        self.voices_changed.emit()
+
+
 MODE_DISPLAY_NAMES = [
     "Speech",
     "Voice Conversion",
@@ -3157,9 +4031,10 @@ MODE_DISPLAY_NAMES = [
     "Audio Isolation",
     "Speakers Separation",
     "Make Voice",
+    "Voice Library",
 ]
 
-MODE_INTERNAL_KEYS = ["tts", "sts", "ttm", "stt", "se", "sfx", "svs", "ss", "train"]
+MODE_INTERNAL_KEYS = ["tts", "sts", "ttm", "stt", "se", "sfx", "svs", "ss", "train", "voices"]
 
 
 class VoderGUI(QMainWindow):
@@ -3237,9 +4112,10 @@ class VoderGUI(QMainWindow):
         sidebar_layout.setSpacing(0)
 
         self.mode_list = QListWidget()
-        self.mode_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.mode_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.mode_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.mode_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.mode_list.setToolTip("Scroll to see all VODER tools, including Make Voice.")
         self.mode_list.setStyleSheet(f"""
             QListWidget {{
                 background-color: {THEME['sidebar_background']};
@@ -3294,6 +4170,7 @@ class VoderGUI(QMainWindow):
         self.svs_tab = SVSTab()
         self.ss_tab = SSTab()
         self.train_tab = TrainTab()
+        self.voice_library_tab = VoiceLibraryTab()
 
         self.content_stack.addWidget(self.tts_tab)
         self.content_stack.addWidget(self.sts_tab)
@@ -3304,6 +4181,7 @@ class VoderGUI(QMainWindow):
         self.content_stack.addWidget(self.svs_tab)
         self.content_stack.addWidget(self.ss_tab)
         self.content_stack.addWidget(self.train_tab)
+        self.content_stack.addWidget(self.voice_library_tab)
 
         content_wrapper = QWidget()
         content_layout = QVBoxLayout(content_wrapper)
@@ -3344,6 +4222,14 @@ class VoderGUI(QMainWindow):
         self.audio_stop_btn.setEnabled(False)
         self.audio_stop_btn.clicked.connect(self.stop_audio)
         audio_row.addWidget(self.audio_stop_btn)
+
+        self.open_output_btn = QPushButton("Open Folder")
+        self.open_output_btn.setStyleSheet(get_surface_button_style())
+        self.open_output_btn.setCursor(Qt.PointingHandCursor)
+        self.open_output_btn.setFixedWidth(90)
+        self.open_output_btn.setToolTip("Open the results folder in Explorer")
+        self.open_output_btn.clicked.connect(self.open_output_folder)
+        audio_row.addWidget(self.open_output_btn)
 
         audio_layout.addLayout(audio_row)
         content_layout.addWidget(audio_frame)
@@ -3440,12 +4326,61 @@ class VoderGUI(QMainWindow):
         self.ss_tab.run_signal.connect(self.run_command)
         self.train_tab.run_signal.connect(self.run_command)
 
+        # Voice library wiring: training finishes -> list refreshes; "Use" and
+        # "+ Train New" cross-navigate without hunting through tabs.
+        self.tts_tab.train_voice_requested.connect(self.goto_train_tab)
+        self.voice_library_tab.train_requested.connect(self.goto_train_tab)
+        self.train_tab.voices_changed.connect(self.refresh_voice_library)
+        self.voice_library_tab.voices_changed.connect(self.refresh_voice_library)
+        self.train_tab.use_voice_signal.connect(self.use_saved_voice)
+        self.voice_library_tab.use_voice_signal.connect(self.use_saved_voice)
+        self.tts_tab.extreme_cb.stateChanged.connect(self.tts_tab._update_voice_mode_hints)
+
         self.run_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
         self.run_shortcut.activated.connect(self.run_current_tab)
 
         self.ready_timer = QTimer()
         self.ready_timer.timeout.connect(self.update_readiness)
         self.ready_timer.start(500)
+
+        self.refresh_voice_library()
+
+    def refresh_voice_library(self):
+        """Re-scan saved voices everywhere after training / rename / delete."""
+        for widget in (self.tts_tab, self.train_tab, self.voice_library_tab):
+            if hasattr(widget, "refresh_voice_library"):
+                widget.refresh_voice_library()
+
+    def goto_train_tab(self):
+        index = MODE_DISPLAY_NAMES.index("Make Voice")
+        self.mode_list.setCurrentRow(index)
+        self.content_stack.setCurrentIndex(index)
+
+    def use_saved_voice(self, name):
+        """Voice Library -> Speech: switch mode and pick the saved voice."""
+        index = MODE_DISPLAY_NAMES.index("Speech")
+        self.mode_list.setCurrentRow(index)
+        self.content_stack.setCurrentIndex(index)
+        self.tts_tab.sub_mode.setCurrentText("Speech")
+        self.tts_tab.adopt_saved_voice(name)
+        if hasattr(self.tts_tab, "tts_status_label"):
+            self.tts_tab.set_generation_status(f"Saved voice selected: {name}. Enter text and run.")
+
+    def open_output_folder(self):
+        folder = os.path.join(VODER_ROOT, "results")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            if self.last_output_path and os.path.exists(self.last_output_path):
+                if os.name == "nt":
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(self.last_output_path)])
+                    return
+            if os.name == "nt":
+                os.startfile(folder)
+            elif os.name == "posix":
+                opener = "open" if os.uname().sysname == "Darwin" else "xdg-open"  # noqa
+                subprocess.Popen([opener, folder])
+        except Exception:
+            pass
 
     def toggle_terminal(self):
         self.terminal_visible = not self.terminal_visible
@@ -3462,6 +4397,8 @@ class VoderGUI(QMainWindow):
     def run_command(self, args):
         if self.running:
             return
+        if hasattr(self, "tts_tab") and self.content_stack.currentWidget() == self.tts_tab:
+            self.tts_tab.set_generation_status("Starting VODER… live progress will appear here.")
         self.running = True
         self.stop_btn.setEnabled(True)
         self.progress_bar.setVisible(True)
@@ -3485,6 +4422,14 @@ class VoderGUI(QMainWindow):
 
     def on_output(self, line):
         self.console.append(line)
+        if hasattr(self, "tts_tab") and self.content_stack.currentWidget() == self.tts_tab:
+            lower_line = line.lower()
+            if any(word in lower_line for word in ("loading", "generating", "synthesizing", "separating", "progress")):
+                self.tts_tab.set_generation_status(line.strip()[:180])
+            elif "error" in lower_line or "traceback" in lower_line or "exception" in lower_line:
+                self.tts_tab.set_generation_status("Generation error — see the log panel for details.", success=False)
+            elif any(word in lower_line for word in ("success", "saved to", "output:")):
+                self.tts_tab.set_generation_status(line.strip()[:180], success=True)
         detected = self.detect_output_path(line)
         if detected:
             self.last_output_path = detected
@@ -3496,7 +4441,33 @@ class VoderGUI(QMainWindow):
         self.running = False
         self.stop_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
+        command_args = list(self.current_thread.command_args) if self.current_thread else []
         self.current_thread = None
+        # A training run writes a new voice file: re-scan so it shows up
+        # immediately in every voice picker.
+        self.refresh_voice_library()
+        if command_args and command_args[0] == "train":
+            name = self.train_tab.pending_voice_name
+            if returncode == 0:
+                self.train_tab.set_training_status(
+                    f"Saved '{name}'. It is now available in every voice list, "
+                    "even after a restart.", success=True
+                )
+                if name:
+                    self.tts_tab.adopt_saved_voice(name)
+            else:
+                self.train_tab.set_training_status(
+                    f"Training failed (exit code {returncode}). Open the log panel to see why.",
+                    success=False
+                )
+        if hasattr(self, "tts_tab") and self.content_stack.currentWidget() == self.tts_tab:
+            if returncode == 0:
+                self.tts_tab.set_generation_status("Completed. Check the output player below.", success=True)
+            else:
+                self.tts_tab.set_generation_status(
+                    f"Failed (exit code {returncode}). Open the log panel to see the error.",
+                    success=False
+                )
         audio_path = self.detect_output_path(output)
         if audio_path:
             self.last_output_path = audio_path

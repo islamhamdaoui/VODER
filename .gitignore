@@ -15,3 +15,10 @@ src/envs/*/include/
 src/envs/*/share/
 src/envs/*/.venv/
 src/envs/*/pyvenv.cfg
+
+# Local runtime data — never commit trained voices, generated audio, downloaded models or credentials
+src/voices/
+src/results/
+src/models/
+HF_TOKEN.txt
+temp/
