@@ -985,6 +985,7 @@ class DialogueLineEdit(QLineEdit):
 
 class DialogueScriptWidget(QWidget):
     characters_changed = pyqtSignal(set)
+    characters_committed = pyqtSignal(set)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1025,6 +1026,7 @@ class DialogueScriptWidget(QWidget):
         char_edit.setMinimumWidth(100)
         char_edit.setText(character)
         char_edit.textChanged.connect(self.on_text_changed)
+        char_edit.editingFinished.connect(self._commit_characters)
         text_row.addWidget(char_edit)
 
         text_edit = DialogueLineEdit()
@@ -1088,7 +1090,7 @@ class DialogueScriptWidget(QWidget):
             else:
                 btn.setEnabled(True)
                 btn.setVisible(True)
-        self.on_text_changed()
+        self.update_characters(commit=True)
 
     def add_line(self):
         """Add one blank line and focus its text field."""
@@ -1124,7 +1126,7 @@ class DialogueScriptWidget(QWidget):
         text_edit.setText(first_text)
         for char, text in parsed[1:]:
             self.add_row(char, text)
-        self.on_text_changed()
+        self.update_characters(commit=True)
 
     def on_text_changed(self):
         if self.rows:
@@ -1134,7 +1136,7 @@ class DialogueScriptWidget(QWidget):
                     self.add_row()
         self.update_characters()
 
-    def update_characters(self):
+    def update_characters(self, commit=False):
         chars = set()
         seen = set()
         for char_edit, _, _, _, _ in self.rows:
@@ -1143,6 +1145,11 @@ class DialogueScriptWidget(QWidget):
                 chars.add(text.lower())
                 seen.add(text.lower())
         self.characters_changed.emit(chars)
+        if commit:
+            self.characters_committed.emit(chars)
+
+    def _commit_characters(self):
+        self.update_characters(commit=True)
 
     def get_dialogue_items(self):
         items = []
@@ -1177,7 +1184,7 @@ class DialogueScriptWidget(QWidget):
         text_edit.clear()
         delete_btn.setEnabled(False)
         delete_btn.setVisible(False)
-        self.update_characters()
+        self.update_characters(commit=True)
 
     def set_text(self, text):
         self.clear()
@@ -1192,6 +1199,7 @@ class DialogueScriptWidget(QWidget):
                 self.add_row()
             else:
                 self.rows[-1][1].setText(line)
+        self.update_characters(commit=True)
 
     def get_timeline_data(self):
         data = []
@@ -2566,6 +2574,7 @@ class TTSTab(QWidget):
 
         self.tts_mode_single.toggled.connect(self._on_tts_mode_changed)
         self.tts_dialogue_widget.characters_changed.connect(self._on_characters_changed)
+        self.tts_dialogue_widget.characters_committed.connect(self._on_characters_committed)
 
         HelperWidgets.make_separator(self.container_layout)
         HelperWidgets.make_label(self.container_layout, "VOICE SOURCE — choose ONE")
@@ -2837,25 +2846,37 @@ class TTSTab(QWidget):
         self._update_timeline()
 
     def _on_characters_changed(self, chars):
+        # Fires on every keystroke: only refresh the labels/timeline here, so
+        # typing "islam" does not create a picker row for "i", "is", "isl", ...
+        self._update_speaker_label(chars)
+        self._update_timeline()
+
+    def _on_characters_committed(self, chars):
+        # Fires when a character name is finished (focus lost / Enter) or when
+        # a script is pasted, so the pickers get exactly one row per speaker.
         self.tts_voice_list.ensure_keys(chars)
         self.tts_clone_list.ensure_keys(chars)
         if hasattr(self, "tts_saved_voices"):
             self.tts_saved_voices.ensure_characters(chars)
-        if hasattr(self, "dialogue_speakers_label"):
-            names = sorted({c.strip() for c in chars if c and c.strip()}, key=str.casefold)
-            single = hasattr(self, "tts_mode_single") and self.tts_mode_single.isChecked()
-            self.dialogue_speakers_label.setVisible(not single)
-            if names:
-                self.dialogue_speakers_label.setText(
-                    f"{len(names)} speaker{'s' if len(names) != 1 else ''}: "
-                    + ", ".join(names)
-                    + "  -  each one picks a voice below."
-                )
-            else:
-                self.dialogue_speakers_label.setText(
-                    "No speakers yet - type a line above or click Paste Script."
-                )
+        self._update_speaker_label(chars)
         self._update_timeline()
+
+    def _update_speaker_label(self, chars):
+        if not hasattr(self, "dialogue_speakers_label"):
+            return
+        names = sorted({c.strip() for c in chars if c and c.strip()}, key=str.casefold)
+        single = hasattr(self, "tts_mode_single") and self.tts_mode_single.isChecked()
+        self.dialogue_speakers_label.setVisible(not single)
+        if names:
+            self.dialogue_speakers_label.setText(
+                f"{len(names)} speaker{'s' if len(names) != 1 else ''}: "
+                + ", ".join(names)
+                + "  -  each one picks a voice below."
+            )
+        else:
+            self.dialogue_speakers_label.setText(
+                "No speakers yet - type a line above or click Paste Script."
+            )
 
     def _on_voice_source_changed(self, selection):
         """Show only the selected voice source so the fields are not confusing."""
