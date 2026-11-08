@@ -458,7 +458,7 @@ class SubprocessThread(QThread):
     def run(self):
         python = sys.executable
         voder_path = os.path.join(_src_dir, 'voder.py')
-        cmd = [python, voder_path] + self.command_args
+        cmd = [python, "-u", voder_path] + self.command_args
         try:
             self.process = subprocess.Popen(
                 cmd,
@@ -966,6 +966,23 @@ class DirectivesWidget(QWidget):
         return self._show_duration
 
 
+class DialogueLineEdit(QLineEdit):
+    """A line edit that detects a pasted multi-line script.
+
+    QLineEdit normally drops everything after the first newline, which made a
+    pasted two-speaker conversation lose every speaker but the first one.
+    """
+
+    multi_line_pasted = pyqtSignal(str)
+
+    def insertFromMimeData(self, source):
+        text = source.text() if source is not None and source.hasText() else ""
+        if text and ("\n" in text or "\r" in text):
+            self.multi_line_pasted.emit(text)
+            return
+        super().insertFromMimeData(source)
+
+
 class DialogueScriptWidget(QWidget):
     characters_changed = pyqtSignal(set)
 
@@ -1010,11 +1027,14 @@ class DialogueScriptWidget(QWidget):
         char_edit.textChanged.connect(self.on_text_changed)
         text_row.addWidget(char_edit)
 
-        text_edit = QLineEdit()
+        text_edit = DialogueLineEdit()
         text_edit.setPlaceholderText("Dialogue text")
         text_edit.setStyleSheet(get_line_edit_style())
         text_edit.setText(text)
         text_edit.textChanged.connect(self.on_text_changed)
+        text_edit.multi_line_pasted.connect(
+            lambda pasted, w=row_widget: self._on_multiline_paste(pasted, w)
+        )
         text_row.addWidget(text_edit, stretch=1)
 
         delete_btn = QPushButton("\u00d7")
@@ -1068,6 +1088,42 @@ class DialogueScriptWidget(QWidget):
             else:
                 btn.setEnabled(True)
                 btn.setVisible(True)
+        self.on_text_changed()
+
+    def add_line(self):
+        """Add one blank line and focus its text field."""
+        self.add_row()
+        row = self.rows[-1]
+        row[1].setFocus()
+        return row
+
+    def _on_multiline_paste(self, pasted, row_widget):
+        """Split a pasted conversation into one row per line."""
+        lines = [
+            line.strip()
+            for line in pasted.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            if line.strip()
+        ]
+        if not lines:
+            return
+        index = next((i for i, row in enumerate(self.rows) if row[3] is row_widget), 0)
+        char_edit, text_edit = self.rows[index][0], self.rows[index][1]
+        current_char = char_edit.text().strip()
+
+        parsed = []
+        for line in lines:
+            if ":" in line:
+                char, text = line.split(":", 1)
+                parsed.append((char.strip() or current_char, text.strip()))
+            else:
+                parsed.append((current_char, line))
+
+        first_char, first_text = parsed[0]
+        if first_char:
+            char_edit.setText(first_char)
+        text_edit.setText(first_text)
+        for char, text in parsed[1:]:
+            self.add_row(char, text)
         self.on_text_changed()
 
     def on_text_changed(self):
@@ -1867,6 +1923,14 @@ class CharacterVoiceList(QWidget):
         header.addWidget(self.count_label)
         header.addStretch()
 
+        self.add_btn = QPushButton("+ Add Voice")
+        self.add_btn.setStyleSheet(get_surface_button_style())
+        self.add_btn.setCursor(Qt.PointingHandCursor)
+        self.add_btn.setFixedHeight(26)
+        self.add_btn.setToolTip("Add another character and pick a different saved voice for it")
+        self.add_btn.clicked.connect(self.add_voice_row)
+        header.addWidget(self.add_btn)
+
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setStyleSheet(get_surface_button_style())
         self.refresh_btn.setCursor(Qt.PointingHandCursor)
@@ -1912,6 +1976,14 @@ class CharacterVoiceList(QWidget):
             row.char_edit.setText(character)
         self.rows_layout.addWidget(row)
         self.rows.append(row)
+        return row
+
+    def add_voice_row(self):
+        """Add a blank character row so another voice can be picked."""
+        row = self.ensure_row()
+        if row.char_edit is not None:
+            row.char_edit.setFocus()
+        self._update_hint()
         return row
 
     def ensure_characters(self, characters):
@@ -2447,10 +2519,39 @@ class TTSTab(QWidget):
         import_audio_btn.setStyleSheet(get_surface_button_style())
         import_audio_btn.setCursor(Qt.PointingHandCursor)
         import_audio_btn.clicked.connect(self.on_import_audio)
+        paste_script_btn = QPushButton("Paste Script")
+        paste_script_btn.setStyleSheet(get_surface_button_style())
+        paste_script_btn.setCursor(Qt.PointingHandCursor)
+        paste_script_btn.setToolTip("Paste a whole conversation, one 'Name: text' per line")
+        paste_script_btn.clicked.connect(self.paste_dialogue_script)
+        add_line_btn = QPushButton("+ Add Line")
+        add_line_btn.setStyleSheet(get_surface_button_style())
+        add_line_btn.setCursor(Qt.PointingHandCursor)
+        add_line_btn.setToolTip("Add another speaker line")
+        add_line_btn.clicked.connect(self.add_dialogue_line)
         import_row.addWidget(import_script_btn)
         import_row.addWidget(import_audio_btn)
+        import_row.addWidget(paste_script_btn)
+        import_row.addWidget(add_line_btn)
         import_row.addStretch()
         dlg_layout.addLayout(import_row)
+
+        self.dialogue_hint = QLabel(
+            "One line per speaker, e.g.  islam: Hello!  /  despina: Hi there!  "
+            "Paste the whole script with the Paste Script button."
+        )
+        self.dialogue_hint.setWordWrap(True)
+        self.dialogue_hint.setStyleSheet(
+            f"color: {THEME['text_secondary']}; font-size: 11px; padding: 0 2px;"
+        )
+        dlg_layout.addWidget(self.dialogue_hint)
+
+        self.dialogue_speakers_label = QLabel("")
+        self.dialogue_speakers_label.setWordWrap(True)
+        self.dialogue_speakers_label.setStyleSheet(
+            f"color: {THEME['text']}; font-size: 11px; padding: 0 2px;"
+        )
+        dlg_layout.addWidget(self.dialogue_speakers_label)
 
         self.tts_dialogue_widget = DialogueScriptWidget()
         self.tts_dialogue_widget.setMinimumHeight(120)
@@ -2656,6 +2757,60 @@ class TTSTab(QWidget):
             args = ["stt", path]
             self.transcribe_signal.emit(args)
 
+    def paste_dialogue_script(self):
+        """Paste a whole 'Name: text' conversation from the clipboard."""
+        if not hasattr(self, "tts_dialogue_widget"):
+            return
+        text = QApplication.clipboard().text()
+        if not text or not text.strip():
+            self.set_generation_status("Clipboard is empty - copy the script first.", success=False)
+            return
+        self.tts_dialogue_widget.set_text(text)
+        count = len(self.tts_dialogue_widget.get_dialogue_items())
+        if count:
+            self.set_generation_status(
+                f"Pasted {count} dialogue line{'s' if count != 1 else ''}. "
+                "Now check that every speaker has a voice below.",
+                success=True,
+            )
+        else:
+            self.set_generation_status(
+                "That did not look like a script. Use one line per speaker: name: text",
+                success=False,
+            )
+
+    def add_dialogue_line(self):
+        if hasattr(self, "tts_dialogue_widget"):
+            self.tts_dialogue_widget.add_line()
+            self.set_generation_status("Added a line - choose its speaker and voice.")
+
+    def _dialogue_missing_voices(self):
+        """Characters in the script that have no voice assigned yet."""
+        if not hasattr(self, "tts_dialogue_widget"):
+            return []
+        chars = {
+            char.strip().casefold()
+            for _, char, _, _ in self.tts_dialogue_widget.get_dialogue_items()
+            if char.strip()
+        }
+        if not chars:
+            return []
+        source = self.tts_voice_source.currentText() if hasattr(self, "tts_voice_source") else ""
+        assigned = set()
+        if source.startswith(VOICE_SOURCE_SAVED):
+            for char, name in self.tts_saved_voices.get_items():
+                if char.strip() and name.strip():
+                    assigned.add(char.strip().casefold())
+        elif source.startswith(VOICE_SOURCE_DESCRIBE):
+            for char, desc in self.tts_voice_list.get_items():
+                if char.strip() and desc.strip():
+                    assigned.add(char.strip().casefold())
+        elif source.startswith(VOICE_SOURCE_FILE):
+            for char, path in self.tts_clone_list.get_items():
+                if char.strip() and path.strip():
+                    assigned.add(char.strip().casefold())
+        return sorted(chars - assigned)
+
     def handle_transcription_result(self, text):
         if self._importing_audio:
             self._importing_audio = False
@@ -2675,6 +2830,10 @@ class TTSTab(QWidget):
             self.tts_script_label.hide()
             self.single_directives.hide()
             self.tts_dialogue_container.show()
+        if hasattr(self, "dialogue_hint"):
+            self.dialogue_hint.setVisible(not checked)
+        if hasattr(self, "dialogue_speakers_label"):
+            self.dialogue_speakers_label.setVisible(not checked)
         self._update_timeline()
 
     def _on_characters_changed(self, chars):
@@ -2682,6 +2841,20 @@ class TTSTab(QWidget):
         self.tts_clone_list.ensure_keys(chars)
         if hasattr(self, "tts_saved_voices"):
             self.tts_saved_voices.ensure_characters(chars)
+        if hasattr(self, "dialogue_speakers_label"):
+            names = sorted({c.strip() for c in chars if c and c.strip()}, key=str.casefold)
+            single = hasattr(self, "tts_mode_single") and self.tts_mode_single.isChecked()
+            self.dialogue_speakers_label.setVisible(not single)
+            if names:
+                self.dialogue_speakers_label.setText(
+                    f"{len(names)} speaker{'s' if len(names) != 1 else ''}: "
+                    + ", ".join(names)
+                    + "  -  each one picks a voice below."
+                )
+            else:
+                self.dialogue_speakers_label.setText(
+                    "No speakers yet - type a line above or click Paste Script."
+                )
         self._update_timeline()
 
     def _on_voice_source_changed(self, selection):
@@ -2985,6 +3158,22 @@ class TTSTab(QWidget):
         return args
 
     def on_run(self):
+        if self.sub_mode.currentText() == "Speech" and hasattr(self, "tts_mode_single"):
+            if not self.tts_mode_single.isChecked():
+                if not self.tts_dialogue_widget.get_dialogue_items():
+                    self.set_generation_status(
+                        "Add at least one 'Name: text' line, or click Paste Script.",
+                        success=False,
+                    )
+                    return
+                missing = self._dialogue_missing_voices()
+                if missing:
+                    self.set_generation_status(
+                        "Pick a voice for: " + ", ".join(missing)
+                        + ". Use the voice picker below the script.",
+                        success=False,
+                    )
+                    return
         args = self.build_args()
         if args:
             self.run_signal.emit(args)
@@ -4255,6 +4444,14 @@ class VoderGUI(QMainWindow):
         term_header.addWidget(term_title)
         term_header.addStretch()
 
+        self.term_deps_btn = QPushButton("Deps")
+        self.term_deps_btn.setStyleSheet(get_surface_button_style())
+        self.term_deps_btn.setCursor(Qt.PointingHandCursor)
+        self.term_deps_btn.setFixedWidth(60)
+        self.term_deps_btn.setToolTip("Check and install any missing Python packages")
+        self.term_deps_btn.clicked.connect(self.run_dependencies)
+        term_header.addWidget(self.term_deps_btn)
+
         self.term_copy_btn = QPushButton("Copy")
         self.term_copy_btn.setStyleSheet(get_surface_button_style())
         self.term_copy_btn.setCursor(Qt.PointingHandCursor)
@@ -4419,6 +4616,16 @@ class VoderGUI(QMainWindow):
         self.current_thread.output_signal.connect(self.on_output)
         self.current_thread.finished_signal.connect(self.on_transcribe_finished)
         self.current_thread.start()
+
+    def run_dependencies(self):
+        """Check/install missing packages and show the full pip log."""
+        if not self.terminal_visible:
+            self.toggle_terminal()
+        if self.running:
+            self.console.append("[deps] Another job is running - try again when it finishes.")
+            return
+        self.console.clear()
+        self.run_command(["deps"])
 
     def on_output(self, line):
         self.console.append(line)
@@ -4585,6 +4792,16 @@ class VoderGUI(QMainWindow):
 
 
 def launch():
+    # Dependencies are normally checked by voder.py before this module is
+    # imported; this also covers running the GUI module directly.
+    try:
+        from voders.bootstrap import ensure_dependencies
+        ensure_dependencies()
+        # Subprocesses started by the GUI do not need to check again.
+        os.environ["VODER_SKIP_DEPS"] = "1"
+    except Exception as exc:
+        print(f"[deps] Warning: dependency check failed: {exc}", flush=True)
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 

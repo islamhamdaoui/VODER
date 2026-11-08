@@ -9,6 +9,34 @@ _libs_dir = os.path.join(_src_dir, "libs")
 if _libs_dir not in sys.path:
     sys.path.insert(0, _libs_dir)
 
+
+# --- automatic dependency bootstrap -------------------------------------
+# This must run before numpy/torch are imported so a fresh machine can install
+# missing packages instead of failing with ModuleNotFoundError mid-job.
+def _run_dependency_cli():
+    os.environ.pop("VODER_SKIP_DEPS", None)
+    try:
+        from voders.bootstrap import ensure_dependencies
+    except Exception as exc:
+        print(f"[deps] Could not load the dependency bootstrap: {exc}", flush=True)
+        raise SystemExit(1)
+    ok = ensure_dependencies(force=True)
+    raise SystemExit(0 if ok else 1)
+
+
+if len(sys.argv) > 1 and sys.argv[1].lower() in ("deps", "dependencies", "install-deps"):
+    _run_dependency_cli()
+
+if os.environ.get("VODER_SKIP_DEPS", "").strip().lower() not in ("1", "true", "yes", "on"):
+    try:
+        from voders.bootstrap import ensure_dependencies
+        ensure_dependencies()
+        # The check is done for this process and anything it spawns (the GUI
+        # starts voder.py subprocesses for each job).
+        os.environ["VODER_SKIP_DEPS"] = "1"
+    except Exception as exc:
+        print(f"[deps] Warning: dependency check failed: {exc}", flush=True)
+
 MODELS_DIR = os.path.join(_src_dir, "models")
 
 MODELS_TMP_DIR = os.path.join(MODELS_DIR, "tmp")
@@ -6262,6 +6290,7 @@ def show_oneline_usage():
     print("  svs      - Song Voice Separate (extract vocals/music from song)")
     print("  ss       - Speakers Separator (extract all speakers, or a specific one by number)")
     print("  train    - Train and save voice clones")
+    print("  deps     - Check and install missing Python dependencies")
     print("  quest    - Side-quests (utility tasks): download + Media Manipulation (Sound Effects / Audio Editing / Format & File). Run `quest` with no args to list them all as a tree.")
     print("  chains   - Chain multiple voder tasks: each chain's output feeds later chains")
     print()
@@ -17642,8 +17671,9 @@ if __name__ == "__main__":
     print("  python voder.py cli                   Interactive CLI mode")
     print("  python voder.py <mode> [args...]      Run a one-line command")
     print('  python voder.py cmd1 "&&" cmd2        Extended command chaining')
+    print("  python voder.py deps                  Check and install missing packages")
     print()
-    print("Available modes: tts, sts, ttm, stt, se, sfx, svs, ss, train, quest, chains")
+    print("Available modes: tts, sts, ttm, stt, se, sfx, svs, ss, train, deps, quest, chains")
     print()
     print("Run 'python voder.py <mode>' with no further args for mode-specific help,")
     print("or see docs/COMMAND_CATALOG.md for the full reference.")
