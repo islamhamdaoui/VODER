@@ -2598,6 +2598,28 @@ def _parse_multi_refs(text):
     return [m.strip() for m in matches if m.strip()]
 
 
+#: Audio tokens per part, in characters. Voice design and voice clone are
+#: autoregressive (12 tokens per second of audio, 2048-token ceiling), so a
+#: single multi-page paste is one very long silent pass that can drift or cut
+#: off. Keeping parts around 300 characters (~20s of speech) keeps each pass
+#: short enough to make steady progress.
+QWEN_TTS_PART_CHARS = 300
+
+
+def _qwen_audio_token_cap(text):
+    """Upper bound on audio tokens for ``text`` (12 tokens = 1 second).
+
+    Qwen-TTS defaults to 2048 tokens (~2m50s of audio) no matter how short the
+    text is, so a 28-word line that fails to emit its stop token can grind for
+    ten minutes and then produce a rambling take. Estimating the length from
+    the word count (about 150 words per minute, with generous headroom) keeps
+    the wait proportional to the text.
+    """
+    words = max(1, len((text or "").split()))
+    seconds = words / 2.5 * 2.2
+    return int(max(96, min(2048, round(seconds * 12))))
+
+
 def _split_text_for_tts(text, max_chars=340):
     """Split long text into sentence-aligned chunks.
 
@@ -3195,7 +3217,8 @@ def _assemble_enhanced_dialogue(dialogue_items, voice_data, tts_design_obj=None,
     try:
         clips = []
         total_words = sum(len(item[2].split()) for item in dialogue_items)
-        print(f"Preparing {len(dialogue_items)} line(s), about {total_words} words...",
+        print(f"Preparing {len(dialogue_items)} line(s), about {total_words} words "
+              f"(~{total_words / 2.5 / 60:.1f} min of speech)...",
               flush=True)
         sfx_generator = None
         design_audio_tracker = {}
@@ -3438,21 +3461,60 @@ class QwenTTSVoiceDesign:
             return False
         try:
             import soundfile as sf
-            import torch
-            print(f"  Speaking {len(text.split())} words with voice: "
+            words = len((text or "").split())
+            print(f"  Speaking {words} words with voice: "
                   f"{voice_instruct[:60]}{'...' if len(voice_instruct) > 60 else ''}",
                   flush=True)
+            # Voice design is autoregressive at 12 tokens per second of audio
+            # (model ceiling: 2048 tokens, i.e. ~2m50s). A pasted multi-page
+            # script is one enormous pass that can run for ten minutes and then
+            # drift or cut off, so long text is spoken in sentence-sized parts.
+            chunks = _split_text_for_tts(text, max_chars=QWEN_TTS_PART_CHARS)
+            if not chunks:
+                return False
+            if len(chunks) > 1:
+                estimate = words / 2.5
+                print(f"  Note: {words} words is long for one pass "
+                      f"(~{estimate:.0f}s of speech). Splitting into "
+                      f"{len(chunks)} parts so it cannot stall or get cut off.",
+                      flush=True)
+                print("  Tip: the voice may shift slightly between parts - save "
+                      "a voice from one good take to keep it identical.",
+                      flush=True)
             started = time.time()
-            wavs, sr = _run_with_heartbeat(
-                lambda: self.model.generate_voice_design(
-                    text=text,
-                    language=language,
-                    instruct=voice_instruct
-                ),
-                "speech",
-            )
-            sf.write(output_path, wavs[0], sr)
-            print(f"  Speech ready: {len(wavs[0]) / sr:.1f}s of audio "
+            audio_parts = []
+            sample_rate = None
+            for index, chunk in enumerate(chunks, start=1):
+                if len(chunks) > 1:
+                    print(f"  Part {index}/{len(chunks)}: \"{chunk[:70]}"
+                          f"{'...' if len(chunk) > 70 else ''}\"", flush=True)
+                part_started = time.time()
+                label = (f"speech part {index}/{len(chunks)}"
+                         if len(chunks) > 1 else "speech")
+                wavs, chunk_sr = _run_with_heartbeat(
+                    lambda chunk=chunk: self.model.generate_voice_design(
+                        text=chunk,
+                        language=language,
+                        instruct=voice_instruct,
+                        max_new_tokens=_qwen_audio_token_cap(chunk)
+                    ),
+                    label,
+                )
+                if sample_rate is None:
+                    sample_rate = chunk_sr
+                audio_parts.append(np.asarray(wavs[0]))
+                if len(chunks) > 1:
+                    done = index
+                    average = (time.time() - started) / done
+                    remaining = average * (len(chunks) - done)
+                    print(f"  Part {index}/{len(chunks)} done in "
+                          f"{time.time() - part_started:.1f}s; about "
+                          f"{remaining / 60:.1f} min left", flush=True)
+            if sample_rate is None:
+                return False
+            audio = _join_audio_parts(audio_parts, sample_rate)
+            sf.write(output_path, audio, sample_rate)
+            print(f"  Speech ready: {len(audio) / sample_rate:.1f}s of audio "
                   f"in {time.time() - started:.1f}s", flush=True)
             return True
         except Exception as e:
@@ -3576,14 +3638,18 @@ class QwenTTS:
             return False
         try:
             import soundfile as sf
-            chunks = _split_text_for_tts(text)
+            chunks = _split_text_for_tts(text, max_chars=QWEN_TTS_PART_CHARS)
             if not chunks:
                 return False
             total_chars = sum(len(chunk) for chunk in chunks)
             print(f"  Speaking {len(text.split())} words ({total_chars} chars) "
                   f"in {len(chunks)} part(s)...", flush=True)
+            if len(chunks) > 1:
+                print("  Note: long text is spoken in parts so it cannot stall "
+                      "in one pass.", flush=True)
             audio_parts = []
             sample_rate = None
+            overall_started = time.time()
             for index, chunk in enumerate(chunks, start=1):
                 if len(chunks) > 1:
                     print(f"  Part {index}/{len(chunks)}: \"{chunk[:70]}"
@@ -3595,7 +3661,8 @@ class QwenTTS:
                     lambda chunk=chunk: self.model.generate_voice_clone(
                         text=chunk,
                         language=language,
-                        voice_clone_prompt=self.voice_prompt
+                        voice_clone_prompt=self.voice_prompt,
+                        max_new_tokens=_qwen_audio_token_cap(chunk)
                     ),
                     label,
                 )
@@ -3603,8 +3670,11 @@ class QwenTTS:
                     sample_rate = chunk_sr
                 audio_parts.append(np.asarray(wavs[0]))
                 if len(chunks) > 1:
+                    average = (time.time() - overall_started) / index
+                    remaining = average * (len(chunks) - index)
                     print(f"  Part {index}/{len(chunks)} done in "
-                          f"{time.time() - started:.1f}s", flush=True)
+                          f"{time.time() - started:.1f}s; about "
+                          f"{remaining / 60:.1f} min left", flush=True)
             if sample_rate is None:
                 return False
             audio = _join_audio_parts(audio_parts, sample_rate)
