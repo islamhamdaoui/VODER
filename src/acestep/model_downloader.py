@@ -11,9 +11,14 @@ All ACE-Step models are stored in: src/models/checkpoints/acestep/
 
 import os
 import sys
+import time
 import argparse
 from typing import Optional, List, Dict, Tuple
 from pathlib import Path
+
+# HuggingFace defaults to a 10 second read timeout, which aborts multi-gigabyte
+# downloads on slow links. Set this before importing the hub so it applies.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
 from huggingface_hub import snapshot_download, HfApi
 from loguru import logger
@@ -49,6 +54,33 @@ MAIN_MODEL_COMPONENTS = [
 
 # Default LM model (included in main model)
 DEFAULT_LM_MODEL = "acestep-5Hz-lm-1.7B"
+
+
+def _download_snapshot(repo_id, local_dir, token=None, attempts=3):
+    """Resume-friendly snapshot download for slow or flaky connections.
+
+    ``snapshot_download`` already resumes partial files, but a single read
+    timeout aborts the whole call. Retrying picks up where it stopped; using
+    two workers instead of the default eight keeps a small link from being
+    swamped.
+    """
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return snapshot_download(
+                repo_id=repo_id,
+                local_dir=str(local_dir),
+                local_dir_use_symlinks=False,
+                token=token,
+                max_workers=2,
+                etag_timeout=60,
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning(f"Download attempt {attempt}/{attempts} failed: {exc}")
+            if attempt < attempts:
+                time.sleep(5 * attempt)
+    raise last_error
 
 
 def get_project_root() -> Path:
@@ -156,13 +188,8 @@ def download_main_model(
         print("This may take a while depending on your internet connection...")
         
         # Download the main model
-        snapshot_download(
-            repo_id=MAIN_MODEL_REPO,
-            local_dir=str(checkpoints_dir),
-            local_dir_use_symlinks=False,
-            token=token,
-        )
-        
+        _download_snapshot(MAIN_MODEL_REPO, checkpoints_dir, token=token)
+
         return True, f"Successfully downloaded main model to {checkpoints_dir}"
     except Exception as e:
         error_msg = f"Failed to download main model: {str(e)}"
@@ -209,13 +236,8 @@ def download_submodel(
         print(f"Downloading {model_name} from {repo_id}...")
         print(f"Destination: {model_path}")
         
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=str(model_path),
-            local_dir_use_symlinks=False,
-            token=token,
-        )
-        
+        _download_snapshot(repo_id, model_path, token=token)
+
         return True, f"Successfully downloaded {model_name} to {model_path}"
     except Exception as e:
         error_msg = f"Failed to download {model_name}: {str(e)}"
