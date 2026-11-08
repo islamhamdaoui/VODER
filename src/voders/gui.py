@@ -4131,7 +4131,9 @@ class TrainTab(QWidget):
         self.save_info = QLabel(
             "Your voice is saved as a file in the VODER voices folder and appears "
             "automatically in Speech, Voice Change and Voice Library - even after you "
-            "restart your PC. No links or paths to remember."
+            "restart your PC. No links or paths to remember.\n\n"
+            "Tip: if you like a voice you just generated, press 'Save as Voice' under "
+            "the player instead of adding the file here."
         )
         self.save_info.setWordWrap(True)
         self.save_info.setStyleSheet(

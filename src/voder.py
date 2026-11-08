@@ -8490,7 +8490,8 @@ def oneline_tts(params):
         if prefixes and len(resolved) == len(prefixes):
             unique = list(dict.fromkeys(p.casefold() for p in prefixes))
             if len(unique) == 1:
-                scripts = [s.split(':', 1)[1].strip() for s in scripts]
+                stripped = [s.split(':', 1)[1].strip() for s in scripts]
+                scripts = ["\n".join(part for part in stripped if part)]
                 voices = [prefixes[0]]
                 print(f"Speaking with saved voice '{prefixes[0]}'.")
             else:
