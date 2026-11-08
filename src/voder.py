@@ -1878,8 +1878,11 @@ def _adjust_audio_speed(input_path, target_duration, output_path):
             current_duration = 0.0
         if current_duration <= 0:
             # ffprobe is optional (imageio-ffmpeg only ships ffmpeg), so fall
-            # back to the same soundfile/torchaudio probe used everywhere else.
-            current_duration = _get_audio_duration(input_path)
+            # back to reading the file directly.
+            try:
+                current_duration = sf.info(input_path).duration
+            except Exception:
+                current_duration = 0.0
         if current_duration <= 0 or target_duration <= 0:
             return False
         speed_factor = current_duration / target_duration
