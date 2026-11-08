@@ -2924,7 +2924,9 @@ class TTSTab(QWidget):
         elif use_description:
             self.tts_voice_help.setText(
                 "Describe the voice you want, e.g. warm, friendly female voice. "
-                "This creates a voice style; it does NOT load a saved clone."
+                "This creates a voice style; it does NOT load a saved clone. "
+                "Arabic can't be described - it is cloned from a saved Darija voice, "
+                "so pick 'Saved voices' instead."
             )
         else:
             self.tts_voice_help.setText(

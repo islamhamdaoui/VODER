@@ -64,7 +64,9 @@ def strip_diacritics(text):
 def normalize_text(text):
     """Prepare text for KasbahTTS: unvocalised, no digits, single spaces."""
     text = strip_diacritics(text or "")
-    text = re.sub(r"[ \t]+", " ", text)
+    # Newlines and tabs (pasted multi-line scripts) must become spaces; stray
+    # control characters end up as unknown tokens in the model's vocabulary.
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 

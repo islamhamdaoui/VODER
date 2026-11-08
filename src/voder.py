@@ -7841,6 +7841,34 @@ def _looks_like_speaker(head, specs):
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._\-]{0,38}", head))
 
 
+def _darija_voices():
+    """Saved Darija profiles, newest first."""
+    profiles = [v for v in _voice_lib.list_voices() if v.kind == _voice_lib.KIND_DARIJA]
+    return sorted(profiles, key=lambda p: p.modified, reverse=True)
+
+
+def _only_darija_voice():
+    """The single saved Darija voice, or None when zero or several exist."""
+    seen = {}
+    for profile in _darija_voices():
+        seen.setdefault(profile.name.casefold(), profile)
+    if len(seen) == 1:
+        return next(iter(seen.values()))
+    return None
+
+
+def _is_voice_description(value):
+    """True for a voice-design prompt like 'warm friendly female voice'.
+
+    KasbahTTS clones a real speaker, so a description cannot become a voice;
+    this only matters for a nicer error message and for the last-resort fallback
+    to the user's single saved Darija voice.
+    """
+    if not value or _looks_like_audio_source(value):
+        return False
+    return bool(re.search(r"\s", value.strip()))
+
+
 def _darija_voice_specs(params):
     """Map speaker name -> value from the 'voice' arguments.
 
@@ -7891,11 +7919,9 @@ def _maybe_handle_darija_tts(params):
     if not default_name and not specs:
         # No voice was named: if there is exactly one Darija voice saved, use it
         # instead of failing. (Two or more is ambiguous, so we ask.)
-        darija_voices = [
-            v for v in _voice_lib.list_voices() if v.kind == _voice_lib.KIND_DARIJA
-        ]
-        if len(darija_voices) == 1:
-            default_name = darija_voices[0].name
+        only_darija = _only_darija_voice()
+        if only_darija is not None:
+            default_name = only_darija.name
             print(f"Using the only saved Darija voice, '{default_name}'.")
     assignments = []
     for speaker, text in parsed:
@@ -7903,11 +7929,10 @@ def _maybe_handle_darija_tts(params):
         if not key:
             print("Error: Darija speech needs a voice. Pass a saved .ttsdz voice "
                   "or train one with 'train \"voice:name\" <recording>'.")
-            names = [v.name for v in _voice_lib.list_voices()
-                     if v.kind == _voice_lib.KIND_DARIJA]
+            names = list(dict.fromkeys(v.name for v in _darija_voices()))
             if names:
-                print("Saved Darija voices: " + ", ".join(sorted(set(names))))
-                print(f'Example: tts script "{sorted(set(names))[0]}: <Arabic text>"')
+                print("Saved Darija voices: " + ", ".join(names))
+                print(f'Example: tts script "{names[0]}: <Arabic text>"')
             return False
         assignments.append((key, speaker or default_name, text))
 
@@ -7922,22 +7947,38 @@ def _maybe_handle_darija_tts(params):
     # --- references: saved profiles or recordings to clone from -----------
     profiles = {}
     audio_refs = {}
+    only_darija = _only_darija_voice()
     for key in wanted:
         value = specs.get(key) or (default_name if len(wanted) == 1 else '')
         if value and _looks_like_audio_source(value):
             audio_refs[key] = value
             continue
         saved = _voice_lib.find_voice(value or key, kind=_voice_lib.KIND_DARIJA)
+        if not saved and only_darija is not None and _is_voice_description(value):
+            # The user described a voice ("warm female voice"), which the
+            # standard engine supports but KasbahTTS cannot do. Rather than
+            # failing, speak the Arabic with the one Darija voice they own.
+            print(f"Note: KasbahTTS cannot invent a voice from the description "
+                  f"'{value}' - Arabic is cloned from a real recording.")
+            print(f"Using your saved Darija voice '{only_darija.name}' instead.")
+            saved = only_darija.path
         if not saved:
             name = display.get(key) or key
-            other = _voice_lib.find_voice(value or key)
-            if other:
+            if _is_voice_description(value):
+                print(f"Error: KasbahTTS cannot create a voice from a description "
+                      f"('{value}'). Arabic voices are cloned from a real recording.")
+                print("Do one of these instead:")
+                print(f'  tts script "{name}: <Arabic text>" voice "{name}: recording.mp3"')
+                print(f'  python voder.py train "voice:{name}" <recording>')
+            elif _voice_lib.find_voice(value or key):
                 print(f"Error: '{name}' is not a Darija voice, and Arabic text needs one.")
-                print("Train a Darija (Arabic) voice from a short Arabic recording:")
+                print(f'  python voder.py train "voice:{name}" <recording>')
             else:
                 print(f"Error: no Darija voice named '{name}'.")
-                print("Train one from a short Arabic recording:")
-            print(f'  python voder.py train "voice:{name}" <recording>')
+                print(f'  python voder.py train "voice:{name}" <recording>')
+            names = list(dict.fromkeys(v.name for v in _darija_voices()))
+            if names:
+                print("Saved Darija voices: " + ", ".join(names))
             return False
         payload = module.load_voice_profile(saved)
         if payload is None:
