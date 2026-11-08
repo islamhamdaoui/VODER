@@ -1105,15 +1105,33 @@ class WhisperSTT:
         if self.translate_model is None:
             self.translate_model = self._load_model("large-v3", self.translate_checkpoint_path)
 
-    def transcribe(self, audio_path):
+    @staticmethod
+    def _half_precision_is_safe():
+        """fp16 melts down on pre-Ampere cards: decoder logits become NaN."""
+        try:
+            if not torch.cuda.is_available():
+                return False
+            major, _minor = torch.cuda.get_device_capability(0)
+            return major >= 8
+        except Exception:
+            return False
+
+    def transcribe(self, audio_path, word_timestamps=True):
         if self.model is None:
             return None
-        try:
-            result = self.model.transcribe(audio_path, word_timestamps=True)
-            return result
-        except Exception as e:
-            print(f"Transcription error: {e}")
-            return None
+        # Turbo checkpoints in fp16 overflow to NaN logits on Turing (sm75) and
+        # older cards, which surfaced as "Expected parameter logits ... invalid
+        # values" and silently cost us the reference transcript.
+        for fp16 in (self._half_precision_is_safe(), False):
+            try:
+                return self.model.transcribe(
+                    audio_path, word_timestamps=word_timestamps, fp16=fp16)
+            except Exception as e:
+                if fp16:
+                    continue
+                print(f"Transcription error: {e}")
+                return None
+        return None
 
     def translate(self, audio_path):
         self.ensure_translate_model()
@@ -4747,7 +4765,7 @@ def validate_file_exists(path):
 
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.webm', '.m4v', '.3gp', '.wmv'}
 
-VOICE_PROFILE_EXTENSIONS = {'.tts', '.ttse'}
+VOICE_PROFILE_EXTENSIONS = {'.tts', '.ttse', '.ttsdz'}
 
 _AUDIO_VIDEO_URL = 'audio file / video file / supported platform URL'
 
@@ -5779,6 +5797,9 @@ def parse_oneline_args(args):
         has_test = False
         use_first = False
         use_extreme = False
+        use_darija = False
+        use_standard = False
+        _train_keywords = {'test', 'first', 'extreme', 'darija', 'standard'}
         while i < len(args):
             arg = args[i]
             arg_lower = arg.lower()
@@ -5789,12 +5810,18 @@ def parse_oneline_args(args):
             elif arg_lower == 'extreme':
                 use_extreme = True
                 i += 1
+            elif arg_lower == 'darija':
+                use_darija = True
+                i += 1
+            elif arg_lower == 'standard':
+                use_standard = True
+                i += 1
             elif arg_lower == 'first':
                 use_first = True
                 i += 1
             elif arg_lower == 'test':
                 has_test = True
-                if i + 1 < len(args) and not args[i + 1].lower().startswith('voice:') and not args[i + 1].lower() == 'test' and args[i + 1].lower() != 'first':
+                if i + 1 < len(args) and not args[i + 1].lower().startswith('voice:') and args[i + 1].lower() not in _train_keywords:
                     test_script = args[i + 1]
                     i += 2
                 else:
@@ -5822,6 +5849,8 @@ def parse_oneline_args(args):
         result['params']['test_script'] = test_script
         result['params']['use_first'] = use_first
         result['params']['extreme'] = use_extreme
+        result['params']['darija'] = use_darija
+        result['params']['standard'] = use_standard
         return result
 
     if mode == 'quest':
@@ -6422,6 +6451,10 @@ def _load_voice_prompt(filepath):
     from qwen_tts import VoiceClonePromptItem
     if not os.path.exists(filepath):
         return None
+    if str(filepath).lower().endswith('.ttsdz'):
+        print("Error: this is an Algerian Darija voice (.ttsdz); it speaks Arabic only.")
+        print("Speak Arabic text with it, or train a standard voice for other languages.")
+        return None
     payload = torch.load(filepath, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict) or "items" not in payload:
         return None
@@ -6923,6 +6956,69 @@ def copy_result_to_path(result_path):
 
 TRAIN_TEST_SCRIPT = "The quick brown fox jumps over the lazy dog. She sells seashells by the seashore, while the crystal clear waves gently lap against the warm golden sand. Every morning, the old lighthouse keeper climbs the winding stone stairs to check the beam that guides ships safely through the foggy harbor. In the distance, you can hear the distant rumble of thunder rolling across the wide open plains, signaling that a summer storm is approaching fast."
 
+def _prefers_darija_engine(params, ref_text, ref_lang, test_script=None):
+    """An Arabic reference becomes a Darija voice unless forced otherwise."""
+    if params.get('standard'):
+        return False
+    if params.get('darija'):
+        return True
+    if (ref_lang or '').lower().startswith('ar'):
+        return True
+    module = _darija_engine()
+    if module is None:
+        return False
+    return module.has_arabic(ref_text) or module.has_arabic(test_script or '')
+
+
+def _train_darija_voice(voice_name, clean_vocal, ref_text, test_script=None):
+    module = _darija_engine()
+    if module is None:
+        print("Error: the Algerian Darija engine is unavailable")
+        return False
+
+    print("Arabic speech detected - using the Algerian Darija engine (KasbahTTS).")
+    engine = module.KasbahTTS()
+    try:
+        # KasbahTTS clones from at most ~12s.  Transcribe the *prepared* clip so
+        # the stored transcript matches what the model actually hears; otherwise
+        # the duration estimate is off and the speech gets cut short.  When the
+        # recording already fits (12s or less) the prepared clip says the same
+        # words, so skip the second (slow) Whisper pass.
+        prepared = engine.prepare_reference(clean_vocal)
+        if prepared:
+            original_seconds = _get_audio_duration(clean_vocal)
+            prepared_seconds = _get_audio_duration(prepared)
+            same_speech = (
+                original_seconds <= module.KASBAH_MAX_REF_SECONDS
+                or abs(prepared_seconds - original_seconds) <= 0.5
+            )
+            if not same_speech:
+                clipped_text, _lang = _transcribe_ref_audio(prepared)
+                if clipped_text:
+                    ref_text = clipped_text
+            clean_vocal = prepared
+
+        if not engine.extract_voice(clean_vocal, ref_text=ref_text):
+            print("Error: voice extraction failed")
+            return False
+        saved_path = module.save_voice_profile(engine.voice, voice_name)
+        print(f"Darija voice '{voice_name}' saved to: {saved_path}")
+
+        if test_script:
+            results_dir = os.path.join(os.getcwd(), "results")
+            os.makedirs(results_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            test_output = os.path.join(results_dir, f"voder_tts_darija_{voice_name}_test_{stamp}.wav")
+            print("Testing trained voice...")
+            if engine.synthesize(test_script, test_output):
+                print(f"Test output saved to: {test_output}")
+            else:
+                print("Warning: Test synthesis failed (voice was still saved)")
+        return True
+    finally:
+        engine.cleanup()
+
+
 def oneline_train(params):
     sub_type = params.get('sub_type')
     voice_name = params.get('voice_name', '').lower()
@@ -6988,6 +7084,14 @@ def oneline_train(params):
                     print("Warning: Test synthesis failed (voice was still saved)")
             fish_tts.cleanup()
         else:
+            print("Transcribing voice reference...")
+            ref_text, ref_lang = _transcribe_ref_audio(clean_vocal)
+            if _prefers_darija_engine(params, ref_text, ref_lang, test_script):
+                return _train_darija_voice(
+                    voice_name, clean_vocal, ref_text,
+                    test_script if has_test else None,
+                )
+
             print("Loading Qwen-TTS model...")
             tts = QwenTTS()
             if tts.model is None:
@@ -6995,7 +7099,6 @@ def oneline_train(params):
                 return False
 
             print("Extracting voice characteristics...")
-            ref_text = _transcribe_for_qwen_ref(clean_vocal)
             success = tts.extract_voice(clean_vocal, ref_text=ref_text if ref_text else None)
             if not success:
                 print("Error: Voice extraction failed")
@@ -7083,6 +7186,35 @@ def _transcribe_for_qwen_ref(audio_path):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+def _transcribe_ref_audio(audio_path, stt=None):
+    """Transcribe a reference clip and report the language Whisper heard.
+
+    Used to pick the right engine when a voice is trained: an Arabic reference
+    becomes an Algerian Darija (KasbahTTS) voice instead of a standard one.
+    """
+    owns = stt is None
+    if owns:
+        stt = WhisperSTT()
+    if stt.model is None:
+        return "", ""
+    try:
+        # Word timestamps are only needed for subtitles; skipping them makes
+        # reference transcription noticeably faster.
+        result = stt.transcribe(audio_path, word_timestamps=False)
+        if not result:
+            return "", ""
+        text = re.sub(r'\s+', ' ', result.get("text", "")).strip()
+        return text, (result.get("language") or "").lower()
+    except Exception:
+        return "", ""
+    finally:
+        if owns:
+            stt.cleanup()
+            del stt
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 _ALIGNER_ONNX_PATH = os.path.join(ALIGNER_DIR, "model.onnx")
 _ALIGNER_MODEL_URL = 'https://huggingface.co/deskpai/ctc_forced_aligner/resolve/main/04ac86b67129634da93aea76e0147ef3.onnx'
@@ -7655,7 +7787,267 @@ def _sts_extreme_pass(audio_path):
         return None
     return temp_output.name
 
+# --- Algerian Darija (KasbahTTS) -----------------------------------------
+# The standard engine (Qwen-TTS) has no Arabic at all and Fish-S2Pro needs
+# ~10 GB of VRAM, so Algerian Dardja gets its own small engine. Any TTS request
+# whose text is Arabic is routed here before the standard path checks langs.
+
+_AUDIO_SOURCE_EXTS = {
+    '.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma', '.aiff',
+    '.aif', '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v', '.3gp', '.ts',
+}
+
+
+def _darija_engine():
+    """Import the optional KasbahTTS wrapper (None when it cannot load)."""
+    try:
+        from voders import kasbah_tts
+        return kasbah_tts
+    except Exception as exc:
+        print(f"Darija engine unavailable: {exc}")
+        return None
+
+
+def _looks_like_audio_source(value):
+    if not value:
+        return False
+    ext = os.path.splitext(value)[1].lower()
+    if ext in VOICE_PROFILE_EXTENSIONS:
+        return False  # a saved voice, not a recording to clone from
+    if os.path.exists(value) or is_youtube_url(value):
+        return True
+    return ext in _AUDIO_SOURCE_EXTS
+
+
+def _split_speaker_line(line):
+    """Split "name: text" into (name, text); the name may be None."""
+    head, sep, body = line.partition(':')
+    if not sep or not body.strip():
+        return None, line.strip()
+    head = head.strip()
+    if not head or len(head) > 60 or '//' in head or '\\' in head:
+        return None, line.strip()
+    return head, body.strip()
+
+
+def _looks_like_speaker(head, specs):
+    """True when 'head' from "head: text" is a speaker name, not Arabic text."""
+    if not head:
+        return False
+    if head.casefold() in specs:
+        return True
+    if _voice_lib.find_voice(head) is not None:
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._\-]{0,38}", head))
+
+
+def _darija_voice_specs(params):
+    """Map speaker name -> value from the 'voice' arguments.
+
+    ``voice "emma"`` means "use the saved voice emma"; ``voice "emma: clip.wav"``
+    means "clone emma from this recording".
+    """
+    sources = params.get('voice', []) or params.get('target', []) or []
+    specs = {}
+    for spec in sources:
+        if not spec:
+            continue
+        name, sep, value = spec.partition(':')
+        if sep and value.strip():
+            specs[name.strip().casefold()] = value.strip()
+        else:
+            specs.setdefault('', spec.strip())
+    return specs
+
+
+def _maybe_handle_darija_tts(params):
+    """Handle Arabic/Darija TTS here. Returns None when not a Darija request."""
+    if params.get('extreme'):
+        return None  # Fish-S2Pro already speaks Arabic
+    scripts = [s for s in params.get('script', []) if s and s.strip()]
+    if not scripts:
+        return None
+
+    module = _darija_engine()
+    if module is None:
+        return None
+
+    specs = _darija_voice_specs(params)
+    parsed = [_split_speaker_line(s) for s in scripts]
+    # "name: text" only counts when the name looks like a speaker (ASCII name,
+    # a voice argument, or a saved voice); otherwise the colon is part of the
+    # Arabic sentence and the whole line is spoken.
+    parsed = [
+        (speaker, text) if _looks_like_speaker(speaker, specs) else (None, raw.strip())
+        for (speaker, text), raw in zip(parsed, scripts)
+    ]
+    if not any(module.has_arabic(text) for _speaker, text in parsed):
+        return None
+
+    results_dir = os.path.join(os.getcwd(), "results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    default_name = specs.get('', '')
+    if not default_name and not specs:
+        # No voice was named: if there is exactly one Darija voice saved, use it
+        # instead of failing. (Two or more is ambiguous, so we ask.)
+        darija_voices = [
+            v for v in _voice_lib.list_voices() if v.kind == _voice_lib.KIND_DARIJA
+        ]
+        if len(darija_voices) == 1:
+            default_name = darija_voices[0].name
+            print(f"Using the only saved Darija voice, '{default_name}'.")
+    assignments = []
+    for speaker, text in parsed:
+        key = (speaker or default_name or '').casefold()
+        if not key:
+            print("Error: Darija speech needs a voice. Pass a saved .ttsdz voice "
+                  "or train one with 'train \"voice:name\" <recording>'.")
+            names = [v.name for v in _voice_lib.list_voices()
+                     if v.kind == _voice_lib.KIND_DARIJA]
+            if names:
+                print("Saved Darija voices: " + ", ".join(sorted(set(names))))
+                print(f'Example: tts script "{sorted(set(names))[0]}: <Arabic text>"')
+            return False
+        assignments.append((key, speaker or default_name, text))
+
+    latin = [text for _k, _n, text in assignments
+             if not module.has_arabic(text) and re.search(r'[A-Za-z]{2,}', text)]
+    if latin:
+        print("Note: KasbahTTS speaks Arabic script only; Latin words will sound wrong.")
+
+    wanted = list(dict.fromkeys(key for key, _name, _text in assignments))
+    display = {key: name for key, name, _text in assignments}
+
+    # --- references: saved profiles or recordings to clone from -----------
+    profiles = {}
+    audio_refs = {}
+    for key in wanted:
+        value = specs.get(key) or (default_name if len(wanted) == 1 else '')
+        if value and _looks_like_audio_source(value):
+            audio_refs[key] = value
+            continue
+        saved = _voice_lib.find_voice(value or key, kind=_voice_lib.KIND_DARIJA)
+        if not saved:
+            name = display.get(key) or key
+            other = _voice_lib.find_voice(value or key)
+            if other:
+                print(f"Error: '{name}' is not a Darija voice, and Arabic text needs one.")
+                print("Train a Darija (Arabic) voice from a short Arabic recording:")
+            else:
+                print(f"Error: no Darija voice named '{name}'.")
+                print("Train one from a short Arabic recording:")
+            print(f'  python voder.py train "voice:{name}" <recording>')
+            return False
+        payload = module.load_voice_profile(saved)
+        if payload is None:
+            print(f"Error: could not read Darija voice: {saved}")
+            return False
+        profiles[key] = payload
+        print(f"Speaking with saved Darija voice '{display.get(key) or key}'.")
+
+    prepared_refs = {}
+    cleanup_refs = []
+    engine = module.KasbahTTS()
+    if audio_refs:
+        # Prepare (clip/normalise) before transcribing so the transcript matches
+        # the exact clip KasbahTTS will clone from; a 21s recording is trimmed to
+        # 12s by the engine and the extra words would skew the duration estimate.
+        stt = WhisperSTT()
+        try:
+            for key, source in audio_refs.items():
+                audio, temp_files = resolve_target_to_audio(source)
+                cleanup_refs.extend(temp_files)
+                if not audio:
+                    print(f"Error: could not read reference audio: {source}")
+                    return False
+                prepared = engine.prepare_reference(audio) or audio
+                print(f"Transcribing reference for '{display.get(key) or key}'...")
+                ref_text, _lang = _transcribe_ref_audio(prepared, stt=stt)
+                prepared_refs[key] = (prepared, ref_text)
+        finally:
+            stt.cleanup()
+            del stt
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    print("Loading the Algerian Darija engine (KasbahTTS)...")
+    if not engine.ensure_model():
+        print("Error: failed to load KasbahTTS")
+        return False
+
+    temp_outputs = []
+    try:
+        for key, (audio, ref_text) in prepared_refs.items():
+            if not ref_text:
+                print(f"Warning: no transcript for '{display.get(key) or key}'; "
+                      "the clone may be less accurate.")
+            if not engine.extract_voice(audio, ref_text=ref_text):
+                print("Error: could not build the Darija voice from that recording")
+                return False
+            profiles[key] = engine.voice
+
+        pieces = []
+        for index, (key, _name, text) in enumerate(assignments):
+            if not engine.load_voice(profiles[key]):
+                print("Error: could not load the Darija voice")
+                return False
+            line_path = os.path.join(results_dir, f".darija_line_{index}_{int(time.time() * 1000)}.wav")
+            print(f"[{index + 1}/{len(assignments)}] {text[:60]}{'...' if len(text) > 60 else ''}")
+            if not engine.synthesize(text, line_path):
+                print("Error: Darija synthesis failed")
+                return False
+            pieces.append(line_path)
+            temp_outputs.append(line_path)
+
+        output_path = os.path.join(results_dir, f"voder_tts_darija_{time.strftime('%Y%m%d_%H%M%S')}.wav")
+        _merge_wavs(pieces, output_path, gap_ms=60)
+        print(f"✓ Success! Output saved to: {output_path}")
+        return True
+    finally:
+        engine.cleanup()
+        for path in temp_outputs:
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+        for path in cleanup_refs:
+            try:
+                if path and os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+
+
+def _merge_wavs(paths, output_path, gap_ms=60):
+    """Join per-line WAVs with a short pause (24 kHz mono, float32)."""
+    import soundfile as sf
+
+    merged = None
+    sample_rate = None
+    gap = None
+    for path in paths:
+        audio, rate = sf.read(path, dtype='float32', always_2d=False)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if merged is None:
+            merged = audio
+            sample_rate = rate
+            gap = np.zeros(int(rate * gap_ms / 1000.0), dtype=np.float32)
+        else:
+            merged = np.concatenate([merged, gap, audio])
+    if merged is None:
+        raise RuntimeError("nothing to merge")
+    sf.write(output_path, merged, sample_rate)
+
+
 def oneline_tts(params):
+    darija_result = _maybe_handle_darija_tts(params)
+    if darija_result is not None:
+        return darija_result
+
     original_cwd = os.getcwd()
     results_dir = os.path.join(original_cwd, "results")
     os.makedirs(results_dir, exist_ok=True)
@@ -16665,7 +17057,7 @@ def is_voice_profile_value(value):
     if not value:
         return False
     lower = value.lower()
-    return lower.endswith('.tts') or lower.endswith('.ttse')
+    return lower.endswith('.tts') or lower.endswith('.ttse') or lower.endswith('.ttsdz')
 
 
 def _parse_load_args(args):

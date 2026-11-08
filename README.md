@@ -159,6 +159,12 @@ python src/voder.py train extreme voice:narrator "ref1.wav"
 python src/voder.py tts script "narrator: Hello there."
 python src/voder.py tts script "narrator: Hello." script "despina: Hi!"  # dialogue
 
+# Algerian Darija (Arabic script) - routed to KasbahTTS automatically
+python src/voder.py train voice:daridja "my_darija_recording.mp3"     # saves a .ttsdz voice
+python src/voder.py tts script "daridja: واش راك خويا، لاباس عليك؟"
+python src/voder.py tts script "اليوم راح نتعلمو الانجليزية"           # needs a .ttsdz voice
+python src/voder.py train voice:narrator "ref.wav" standard           # force the standard engine
+
 # Chains (wire multiple voder oneline tasks together)
 python src/voder.py chains "song" ttm lyrics "la la la" styling "pop" 30 / "voice" svs voice "song" / "cover" sts base "voice" target "ref.wav"
 
@@ -182,6 +188,8 @@ python src/voder.py eva ttw edit objectify "character.glb" reference "bronze_tex
 python src/voder.py eva ttw explorify "scene.png" trajectory "orbit_horizontal"
 python src/voder.py eva ttw explorify desc "a medieval castle on a hill at sunset"
 ```
+
+> **Algerian Darija (Arabic)** — the standard TTS engine speaks ten languages and Arabic is not one of them, so Arabic text and Arabic voice references use **KasbahTTS-V0** (an F5-TTS fine-tune for Algerian Dardja, MIT, ~1.35 GB, downloaded on first use). Voices trained from Arabic recordings are saved as `.ttsdz` and work by name like any other voice. KasbahTTS speaks **Arabic script only**: no Latin/French words, no digits (write numbers as words) and no harakat (VODER strips them). It runs in about 2 GB of VRAM, so it fits 6 GB cards.
 
 > **Project Eva envs** — each Eva model runs in its own isolated Python venv under `src/envs/<model>/`. The first time you use an Eva mode, set up its env once:
 >
@@ -237,6 +245,7 @@ VODER orchestrates state-of-the-art open-source models — each selected for qua
 |-----------|-------|
 | Speech Recognition | [Whisper](https://github.com/openai/whisper) |
 | Voice Synthesis & Cloning | [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), [Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) |
+| Algerian Darija (Arabic) Speech | [KasbahTTS-V0](https://huggingface.co/Voice213DZ/KasbahTTS-V0) (F5-TTS fine-tune, MIT, ~1.35 GB, fits 6 GB cards) |
 | Voice Conversion | [Seed-VC](https://github.com/Plachtaa/seed-vc) |
 | Music Generation | [ACE-Step](https://github.com/ace-step/ACE-Step-1.5), [MiniMax Music 3](https://github.com/MiniMax-AI/MiniMax-Music3) (extreme TTM) |
 | Sound Effects | [TangoFlux](https://github.com/declare-lab/TangoFlux) |

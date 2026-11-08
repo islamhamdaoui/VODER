@@ -57,6 +57,19 @@ VODER_ROOT = os.path.dirname(os.path.dirname(_src_dir))
 
 from voders import voice_library as vlib
 
+
+def voice_kind_tag(kinds):
+    """Readable label for the engines a voice name has a profile for."""
+    labels = []
+    if vlib.KIND_STANDARD in kinds:
+        labels.append("Standard")
+    if vlib.KIND_ENHANCED in kinds:
+        labels.append("Enhanced")
+    if vlib.KIND_DARIJA in kinds:
+        labels.append("Darija")
+    return " + ".join(labels) or "Standard"
+
+
 THEME = {
     'background': '#0D0D0D',
     'surface': '#151515',
@@ -1776,13 +1789,7 @@ class SavedVoicePickerRow(QWidget):
         groups = vlib.group_voices()
         for key in sorted(groups, key=lambda k: groups[k]["name"].casefold()):
             group = groups[key]
-            kinds = group["kinds"]
-            if vlib.KIND_STANDARD in kinds and vlib.KIND_ENHANCED in kinds:
-                tag = "Standard + Enhanced"
-            elif vlib.KIND_ENHANCED in kinds:
-                tag = "Enhanced"
-            else:
-                tag = "Standard"
+            tag = voice_kind_tag(group["kinds"])
             name = group["name"]
             display = name[:1].upper() + name[1:]
             self.combo.addItem(f"{display}  ·  {tag}", ("saved", name))
@@ -1914,6 +1921,8 @@ class SavedVoicePickerRow(QWidget):
         else:
             if vlib.KIND_STANDARD in kinds:
                 text, color = "Ready", THEME["accent"]
+            elif vlib.KIND_DARIJA in kinds:
+                text, color = "Darija - Arabic text only", THEME["accent"]
             elif vlib.KIND_ENHANCED in kinds:
                 text, color = "Enhanced only - tick Enhanced", THEME["warning"]
             else:
@@ -2163,13 +2172,7 @@ class VoiceLibraryPanel(QWidget):
         groups = vlib.group_voices(voices)
         for key in sorted(groups, key=lambda k: groups[k]["name"].casefold()):
             group = groups[key]
-            kinds = group["kinds"]
-            if vlib.KIND_STANDARD in kinds and vlib.KIND_ENHANCED in kinds:
-                tag = "Standard + Enhanced"
-            elif vlib.KIND_ENHANCED in kinds:
-                tag = "Enhanced"
-            else:
-                tag = "Standard"
+            tag = voice_kind_tag(group["kinds"])
             newest = max(group["profiles"], key=lambda p: p.modified)
             try:
                 stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest.modified))
@@ -4132,6 +4135,8 @@ class TrainTab(QWidget):
             "Your voice is saved as a file in the VODER voices folder and appears "
             "automatically in Speech, Voice Change and Voice Library - even after you "
             "restart your PC. No links or paths to remember.\n\n"
+            "Arabic recordings automatically become Algerian Darija voices (.ttsdz), "
+            "which speak Arabic text with the KasbahTTS engine.\n\n"
             "Tip: if you like a voice you just generated, press 'Save as Voice' under "
             "the player instead of adding the file here."
         )

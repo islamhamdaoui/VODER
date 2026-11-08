@@ -1,9 +1,10 @@
 """Persistent voice profile library for VODER.
 
 Voice clones trained by VODER are stored as files in the project ``voices``
-folder (``.tts`` for standard voices, ``.ttse`` for enhanced voices).  This
-module is the single place that discovers those files, so the GUI and the CLI
-always agree about which voices exist and where they are.
+folder (``.tts`` for standard voices, ``.ttse`` for enhanced voices, ``.ttsdz``
+for Algerian Darija voices).  This module is the single place that discovers
+those files, so the GUI and the CLI always agree about which voices exist and
+where they are.
 
 It only uses the Python standard library, so it can safely be imported by the
 GUI without pulling in torch or any model code.
@@ -19,12 +20,19 @@ _SRC_DIR = os.path.dirname(_PACKAGE_DIR)
 APP_DIR = os.path.dirname(_SRC_DIR)
 PROJECT_ROOT = os.environ.get("VODER_HOME") or os.path.dirname(APP_DIR)
 
-VOICE_EXTENSIONS = (".tts", ".ttse")
+VOICE_EXTENSIONS = (".tts", ".ttse", ".ttsdz")
 KIND_STANDARD = "standard"
 KIND_ENHANCED = "enhanced"
-_KIND_ORDER = {KIND_STANDARD: 0, KIND_ENHANCED: 1}
+KIND_DARIJA = "darija"
+_KIND_ORDER = {KIND_STANDARD: 0, KIND_ENHANCED: 1, KIND_DARIJA: 2}
 
-_FILENAME_RE = re.compile(r"^voder_(tts|ttse)_(.+?)_(\d{8}_\d{6})$", re.IGNORECASE)
+_EXTENSION_KIND = {
+    ".tts": KIND_STANDARD,
+    ".ttse": KIND_ENHANCED,
+    ".ttsdz": KIND_DARIJA,
+}
+
+_FILENAME_RE = re.compile(r"^voder_(tts|ttse|ttsdz)_(.+?)_(\d{8}_\d{6})$", re.IGNORECASE)
 
 
 def voices_dir():
@@ -76,9 +84,9 @@ def _split_filename(path):
     ext = ext.lower()
     match = _FILENAME_RE.match(stem)
     if match:
-        kind = KIND_ENHANCED if match.group(1).lower() == "ttse" else KIND_STANDARD
+        kind = _EXTENSION_KIND.get("." + match.group(1).lower(), KIND_STANDARD)
         return match.group(2), kind, match.group(3), ext
-    kind = KIND_ENHANCED if ext == ".ttse" else KIND_STANDARD
+    kind = _EXTENSION_KIND.get(ext, KIND_STANDARD)
     return stem, kind, "", ext
 
 
@@ -103,11 +111,19 @@ class VoiceProfile:
 
     @property
     def kind_label(self):
-        return "Enhanced" if self.kind == KIND_ENHANCED else "Standard"
+        if self.kind == KIND_ENHANCED:
+            return "Enhanced"
+        if self.kind == KIND_DARIJA:
+            return "Darija"
+        return "Standard"
 
     @property
     def is_enhanced(self):
         return self.kind == KIND_ENHANCED
+
+    @property
+    def is_darija(self):
+        return self.kind == KIND_DARIJA
 
     def describe(self):
         try:
@@ -201,8 +217,9 @@ def find_voice(name, kind=None, prefer_enhanced=False):
 
     if kind:
         exact = [p for p in matches if p.kind == kind]
-        if exact:
-            matches = exact
+        if not exact:
+            return None
+        matches = exact
 
     wanted = KIND_ENHANCED if prefer_enhanced else KIND_STANDARD
     matches.sort(key=lambda p: (0 if p.kind == wanted else 1,
@@ -253,7 +270,7 @@ def rename_voice(path, new_name):
     _old_name, _kind, timestamp, _ext = _split_filename(source)
     if not timestamp:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-    kind_tag = "ttse" if ext == ".ttse" else "tts"
+    kind_tag = ext.lstrip(".")
     destination = os.path.join(
         os.path.dirname(source), f"voder_{kind_tag}_{clean}_{timestamp}{ext}"
     )

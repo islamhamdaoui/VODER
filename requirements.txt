@@ -116,3 +116,15 @@ langdetect>=1.0.9
 # - Windows: PyTorch with CUDA support available
 librosa>=0.10.0
 Pillow>=10.0.0
+
+# Algerian Darija TTS (KasbahTTS / F5-TTS).  Inference only: these are
+# installed with --no-deps because their training/demo stack (gradio, wandb,
+# datasets, bitsandbytes) would downgrade transformers and huggingface-hub.
+# See _NO_DEPS_PACKAGES in voders/bootstrap.py.
+f5-tts==1.1.22
+habibi-tts==0.1.1
+vocos==0.1.0
+encodec==0.1.1
+torchdiffeq==0.2.5
+pypinyin==0.55.0
+rjieba==0.2.2

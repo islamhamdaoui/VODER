@@ -554,6 +554,23 @@ python src/voder.py tts script "James: Hello" script "Sarah: Hi" voice "James: h
 python src/voder.py tts script "James: Hello" script "Sarah: Hi" voice "James: hero" voice "Sarah: cheerful female"
 ```
 
+**Algerian Darija (Arabic) — automatic:**
+```bash
+# Arabic-script text is routed to KasbahTTS automatically (no flags needed)
+python src/voder.py tts script "daridja: واش راك خويا، لاباس عليك؟"
+
+# If exactly one Darija voice (.ttsdz) is saved, the name is optional
+python src/voder.py tts script "اليوم راح نتعلمو الانجليزية"
+
+# Two Darija voices speak a dialogue
+python src/voder.py tts script "daridja: واش راك؟" script "other: لاباس عليك؟"
+
+# Clone a Darija voice from a recording on the fly
+python src/voder.py tts script "daridja: واش راك؟" voice "daridja: clip.mp3"
+```
+
+> Arabic text always needs a Darija voice: a standard `.tts` voice (Qwen3-TTS) cannot speak Arabic and VODER will say so. KasbahTTS speaks **Arabic script only** — no Latin/French words, no digits (write numbers as words), no harakat (they are stripped) — and runs in about 2 GB of VRAM. Long text is split into short chunks automatically because the model repeats on long input.
+
 **Newline support in scripts:**
 ```bash
 # Use \n for line breaks in script text
@@ -913,9 +930,9 @@ python src/voder.py tts script "James: Hello!" target first "James:(voice1.wav)(
 
 ### Voice Training (train voice / train extreme voice)
 
-> **Note:** `train` saves a voice clone as a `.tts` (standard Qwen3-TTS) or `.ttse` (extreme Fish S2-Pro) file in `voices/` for later reuse in TTS via the `voice "<name>"` parameter.
+> **Note:** `train` saves a voice clone as a `.tts` (standard Qwen3-TTS), `.ttse` (extreme Fish S2-Pro) or `.ttsdz` (Algerian Darija, KasbahTTS) file in `voices/` for later reuse in TTS via the `voice "<name>"` parameter.
 
-Train a voice clone from reference audio and save it for later reuse. Oneline-only command. Use `train voice` for Qwen3-TTS (`.tts` files) or `train extreme voice` for Fish S2-Pro (`.ttse` files).
+Train a voice clone from reference audio and save it for later reuse. Oneline-only command. Use `train voice` for Qwen3-TTS (`.tts` files) or `train extreme voice` for Fish S2-Pro (`.ttse` files). An **Arabic** reference is detected automatically and saved as an Algerian Darija voice (`.ttsdz`) instead, because Qwen3-TTS cannot speak Arabic at all.
 
 ```bash
 # Train a voice from a single reference (standard Qwen3-TTS)
@@ -941,6 +958,11 @@ python src/voder.py train extreme voice:character-name "ref1.wav" "ref2.wav"
 
 # Train extreme with test sample
 python src/voder.py train extreme voice:character-name "ref.wav" test
+
+# Arabic / Algerian Darija (auto-detected, saves .ttsdz)
+python src/voder.py train voice:daridja "darija_clip.mp3" test "واش راك خويا؟"
+python src/voder.py train voice:daridja "clip.wav" darija      # force the Darija engine
+python src/voder.py train voice:character-name "clip.wav" standard  # force the standard engine
 ```
 
 **Parameters:**
@@ -949,12 +971,14 @@ python src/voder.py train extreme voice:character-name "ref.wav" test
 |-----------|-------------|----------|
 | `voice:name` | Character name for the trained voice (used to reference it later) | Yes |
 | `extreme` | Use Fish S2-Pro instead of Qwen3-TTS; saves `.ttse` instead of `.tts` | No |
+| `darija` | Force the Algerian Darija engine (KasbahTTS, `.ttsdz`) even if the language is unclear | No |
+| `standard` | Force the standard Qwen3-TTS engine even when the reference is Arabic | No |
 | `"path1" "path2" ...` | One or more audio file paths for reference audio | Yes |
 | `first` | Extract only the first reference's speaker from all others via TSE before compiling (oneline only) | No |
 | `test` | Generate a test sample using a hardcoded 30+ second script | No |
 | `test "script"` | Generate a test sample using a custom test script | No |
 
-**Output:** Standard trained voices are saved as `voder_tts_character-name_timestamp.tts`; extreme trained voices are saved as `voder_ttse_character-name_timestamp.ttse` — both in the `voices/` directory. `.tts` files work only without `extreme`; `.ttse` files work only with `extreme`.
+**Output:** Standard trained voices are saved as `voder_tts_character-name_timestamp.tts`; extreme trained voices are saved as `voder_ttse_character-name_timestamp.ttse`; Darija voices are saved as `voder_ttsdz_character-name_timestamp.ttsdz` — all in the `voices/` directory. `.tts` files work only without `extreme`; `.ttse` files work only with `extreme`; `.ttsdz` files speak Arabic text.
 
 **Using Trained Voices:** See the `voice` parameter in the TTS section above for syntax (`"character-name"`, `"character-name:path.tts"`, `"character-name:path.ttse"`, `"character-name:another-name"`).
 

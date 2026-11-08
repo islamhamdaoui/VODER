@@ -223,6 +223,16 @@ def _start_pip(cmd):
     )
 
 
+# Inference-only packages.  f5-tts and habibi-tts declare their whole training
+# and demo stack (gradio, wandb, datasets, bitsandbytes) and installing that
+# would also drag transformers/huggingface-hub to incompatible versions.  VODER
+# imports neither, so these are installed without their dependency metadata.
+_NO_DEPS_PACKAGES = {
+    "f5-tts", "habibi-tts", "vocos", "encodec", "torchdiffeq", "pypinyin",
+    "rjieba",
+}
+
+
 def _pip_install(spec, constraints_path=None):
     """Install one requirement, streaming pip's output line by line.
 
@@ -234,6 +244,8 @@ def _pip_install(spec, constraints_path=None):
            "--retries", "5", "--timeout", "60"]
     if constraints_path:
         cmd += ["-c", constraints_path]
+    if _normalized(requirement_name(spec)) in _NO_DEPS_PACKAGES:
+        cmd.append("--no-deps")
     cmd.append(spec)
 
     _log("")
