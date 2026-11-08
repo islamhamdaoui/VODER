@@ -3244,6 +3244,14 @@ def _assemble_enhanced_dialogue(dialogue_items, voice_data, tts_design_obj=None,
             if char.lower() != 'sfx':
                 headline = text if len(text) <= 70 else text[:70].rstrip() + "..."
                 print(f"[{i + 1}/{len(dialogue_items)}] {char}: {headline}", flush=True)
+                # Warn before the long wait, not after it: one pasted page can
+                # hide ten minutes of silence behind a single heartbeat line.
+                words = len(text.split())
+                if words > 60 and not use_extreme:
+                    parts = len(_split_text_for_tts(text, max_chars=QWEN_TTS_PART_CHARS))
+                    print(f"  Note: {words} words is a long line "
+                          f"(~{words / 2.5:.0f}s of speech). It will be spoken in "
+                          f"{parts} shorter parts so it cannot stall.", flush=True)
             if char.lower() == 'sfx':
                 duration = directives.get('duration')
                 if duration is None:
@@ -3643,7 +3651,8 @@ class QwenTTS:
                 return False
             total_chars = sum(len(chunk) for chunk in chunks)
             print(f"  Speaking {len(text.split())} words ({total_chars} chars) "
-                  f"in {len(chunks)} part(s)...", flush=True)
+                  f"in {len(chunks)} part(s), about "
+                  f"{len(text.split()) / 2.5:.0f}s of speech...", flush=True)
             if len(chunks) > 1:
                 print("  Note: long text is spoken in parts so it cannot stall "
                       "in one pass.", flush=True)
