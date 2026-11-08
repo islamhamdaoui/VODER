@@ -15,12 +15,16 @@ if _libs_dir not in sys.path:
 # missing packages instead of failing with ModuleNotFoundError mid-job.
 def _run_dependency_cli():
     os.environ.pop("VODER_SKIP_DEPS", None)
+    flags = {arg.lower() for arg in sys.argv[2:]}
     try:
         from voders.bootstrap import ensure_dependencies
     except Exception as exc:
         print(f"[deps] Could not load the dependency bootstrap: {exc}", flush=True)
         raise SystemExit(1)
-    ok = ensure_dependencies(force=True)
+    if "--check" in flags:
+        ok = ensure_dependencies(check_only=True)
+    else:
+        ok = ensure_dependencies(force="--force" in flags)
     raise SystemExit(0 if ok else 1)
 
 
@@ -36,6 +40,16 @@ if os.environ.get("VODER_SKIP_DEPS", "").strip().lower() not in ("1", "true", "y
         os.environ["VODER_SKIP_DEPS"] = "1"
     except Exception as exc:
         print(f"[deps] Warning: dependency check failed: {exc}", flush=True)
+
+# --- external tools ------------------------------------------------------
+# ffmpeg is used for dialogue assembly, SFX, speed changes and music mixing.
+# Windows almost never has it on PATH, so resolve it once here; every child
+# process inherits the updated PATH.
+try:
+    from voders.media_tools import ensure_ffmpeg
+    ensure_ffmpeg(verbose=True)
+except Exception as exc:
+    print(f"[media] Warning: could not set up ffmpeg: {exc}", flush=True)
 
 MODELS_DIR = os.path.join(_src_dir, "models")
 
@@ -1853,12 +1867,19 @@ def _mix_audio_at_target_sr(vocals_path, music_path, output_path, target_sr=4800
 
 def _adjust_audio_speed(input_path, target_duration, output_path):
     try:
-        probe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                     '-of', 'default=noprint_wrappers=1:nokey=1', input_path]
-        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
-        if probe_result.returncode != 0:
-            return False
-        current_duration = float(probe_result.stdout.strip())
+        current_duration = 0.0
+        try:
+            probe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                         '-of', 'default=noprint_wrappers=1:nokey=1', input_path]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+            if probe_result.returncode == 0:
+                current_duration = float(probe_result.stdout.strip() or 0)
+        except (OSError, ValueError):
+            current_duration = 0.0
+        if current_duration <= 0:
+            # ffprobe is optional (imageio-ffmpeg only ships ffmpeg), so fall
+            # back to the same soundfile/torchaudio probe used everywhere else.
+            current_duration = _get_audio_duration(input_path)
         if current_duration <= 0 or target_duration <= 0:
             return False
         speed_factor = current_duration / target_duration
