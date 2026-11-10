@@ -4662,7 +4662,7 @@ class VoderGUI(QMainWindow):
             answer = QMessageBox.question(
                 self, "Very short sample",
                 f"This clip is only {seconds:.1f} seconds long, so the clone may sound "
-                "unstable.\n\n10-30 seconds of one clean voice gives much better results. "
+                "unstable.\n\n12-20 seconds of one clean voice gives much better results. "
                 "Try it anyway?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No
             )
@@ -4672,8 +4672,8 @@ class VoderGUI(QMainWindow):
             answer = QMessageBox.question(
                 self, "Long sample",
                 f"This clip is {seconds:.0f} seconds long. A clone only needs a short, "
-                "clean piece of one speaker - extra music, other speakers or silence "
-                "makes it worse.\n\nSave it anyway?",
+                "clean piece of one speaker, so VODER will keep the first 10-12 seconds "
+                "and cut at a pause.\n\nSave it anyway?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No
             )
             if answer != QMessageBox.Yes:
