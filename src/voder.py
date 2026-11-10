@@ -3626,6 +3626,51 @@ class QwenTTSVoiceDesign:
                 pass
 
 
+def _trim_clone_reference(audio_path, max_seconds=12.0, min_seconds=5.0):
+    """Cut a short, sentence-aligned window out of a voice reference.
+
+    Cloning conditions on every second of the reference, so a whole generated
+    page (30-90s) makes the clone drift, and the model starts stretching words.
+    A 10-12s window cut at a quiet point keeps the timbre without slicing a
+    word in half. Returns ``(path, temp_files)``; short clips pass through.
+    """
+    try:
+        import soundfile as sf
+
+        data, sample_rate = sf.read(audio_path, always_2d=True)
+        if not len(data):
+            return audio_path, []
+        total = len(data) / sample_rate
+        if total <= max_seconds + 0.5:
+            return audio_path, []
+
+        mono = data.mean(axis=1)
+        step = max(1, int(sample_rate * 0.02))
+        levels = [float(np.abs(mono[i:i + step]).mean())
+                  for i in range(0, len(mono) - step, step)]
+        if not levels:
+            return audio_path, []
+        quiet = (max(levels) or 1.0) * 0.06
+        first = min(len(levels) - 1, int(min_seconds / 0.02))
+        last = min(len(levels) - 1, int(max_seconds / 0.02))
+        cut = last
+        for index in range(last, first - 1, -1):
+            if levels[index] <= quiet:
+                cut = index
+                break
+        cut_samples = max(cut * step, int(min_seconds * sample_rate))
+        audio = data[:cut_samples]
+        handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        handle.close()
+        sf.write(handle.name, audio, sample_rate)
+        print(f"  Voice reference trimmed to {len(audio) / sample_rate:.1f}s "
+              f"(from {total:.1f}s) for a stable clone.", flush=True)
+        return handle.name, [handle.name]
+    except Exception as exc:
+        print(f"  Warning: could not trim the voice reference ({exc}) - using it whole.")
+        return audio_path, []
+
+
 def _enforce_voice_clone_limit(audio_path, max_seconds, engine_label="TTS"):
     try:
         import torchaudio
@@ -5946,7 +5991,8 @@ def parse_oneline_args(args):
         use_extreme = False
         use_darija = False
         use_standard = False
-        _train_keywords = {'test', 'first', 'extreme', 'darija', 'standard'}
+        use_clean = False
+        _train_keywords = {'test', 'first', 'extreme', 'darija', 'standard', 'clean'}
         while i < len(args):
             arg = args[i]
             arg_lower = arg.lower()
@@ -5956,6 +6002,9 @@ def parse_oneline_args(args):
                 i += 1
             elif arg_lower == 'extreme':
                 use_extreme = True
+                i += 1
+            elif arg_lower == 'clean':
+                use_clean = True
                 i += 1
             elif arg_lower == 'darija':
                 use_darija = True
@@ -5998,6 +6047,7 @@ def parse_oneline_args(args):
         result['params']['extreme'] = use_extreme
         result['params']['darija'] = use_darija
         result['params']['standard'] = use_standard
+        result['params']['clean'] = use_clean
         return result
 
     if mode == 'quest':
@@ -7174,6 +7224,7 @@ def oneline_train(params):
     test_script = params.get('test_script')
     use_first = params.get('use_first', False)
     use_extreme = params.get('extreme', False)
+    use_clean = params.get('clean', False)
 
     if sub_type != 'voice':
         print("Error: Only 'voice' training is supported")
@@ -7196,7 +7247,14 @@ def oneline_train(params):
                 print(f"Error: Failed to resolve reference: {ref_paths[0]}")
                 return False
             _cleanup.extend(_cl)
-            clean_vocal = svs_extract_vocals(resolved_audio)
+            if use_clean:
+                # The user saved a voice straight from generated speech: it is
+                # already clean, and running a music separator over it alters
+                # the very timbre we are trying to keep.
+                print("Using the generated speech as-is (no music separation).")
+                clean_vocal = resolved_audio
+            else:
+                clean_vocal = svs_extract_vocals(resolved_audio)
             if clean_vocal and clean_vocal != resolved_audio:
                 _cleanup.append(clean_vocal)
             if resolved_audio not in _cleanup and resolved_audio != clean_vocal:
@@ -7231,6 +7289,8 @@ def oneline_train(params):
                     print("Warning: Test synthesis failed (voice was still saved)")
             fish_tts.cleanup()
         else:
+            clean_vocal, _trim_cleanup = _trim_clone_reference(clean_vocal)
+            _cleanup.extend(_trim_cleanup)
             print("Transcribing voice reference...")
             ref_text, ref_lang = _transcribe_ref_audio(clean_vocal)
             if _prefers_darija_engine(params, ref_text, ref_lang, test_script):

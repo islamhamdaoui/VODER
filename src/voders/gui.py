@@ -4719,7 +4719,16 @@ class VoderGUI(QMainWindow):
         self.console.append(
             f"\n[save] Creating voice '{name}' from {os.path.basename(path)} ..."
         )
-        self.run_command(["train", f"voice:{name}", path])
+        args = ["train", f"voice:{name}", path]
+        last_args = getattr(self, "last_args", [])
+        if (self.last_command == "tts"
+                and "music" not in last_args
+                and not os.path.basename(path).endswith("_m.wav")):
+            # Generated speech is already a clean single voice. Tell train to
+            # skip the music separator, which otherwise degrades the timbre we
+            # are trying to keep.
+            args.append("clean")
+        self.run_command(args)
 
     def toggle_terminal(self):
         self.terminal_visible = not self.terminal_visible
@@ -4737,6 +4746,7 @@ class VoderGUI(QMainWindow):
         if self.running:
             return
         self.last_command = args[0] if args else ""
+        self.last_args = list(args)
         if hasattr(self, "tts_tab") and self.content_stack.currentWidget() == self.tts_tab:
             self.tts_tab.set_generation_status("Starting VODER… live progress will appear here.")
         self.running = True
