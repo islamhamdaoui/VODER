@@ -2663,11 +2663,42 @@ def _split_text_for_tts(text, max_chars=340):
     return final
 
 
-def _run_with_heartbeat(work, label, interval=15):
+_INTERRUPT_CONTEXT = {"flag": None}
+
+
+def _install_sigint_handler():
+    """Make Ctrl+C finish the current part instead of losing the whole run.
+
+    The handler only records the request (so the part in flight can finish and
+    be saved). A second Ctrl+C raises KeyboardInterrupt like before.
+    """
+    import signal
+
+    def handler(signum, frame):
+        flag = _INTERRUPT_CONTEXT.get("flag")
+        if isinstance(flag, list) and not flag:
+            flag.append(True)
+            print("\n  Stop requested: finishing this part, then saving what is "
+                  "already done.\n  (Press Ctrl+C again to abort without "
+                  "saving.)", flush=True)
+            return
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, handler)
+    except (ValueError, OSError):
+        pass
+
+
+def _run_with_heartbeat(work, label, interval=15, stop_flag=None):
     """Run ``work`` in a thread and print a heartbeat while it is busy.
 
     Generating one sentence can take a minute on a small GPU, with no output at
     all. These lines make it obvious that the job is alive, not frozen.
+
+    When ``stop_flag`` is a list, the first Ctrl+C does not kill the process:
+    the signal handler records the request, the current part is allowed to
+    finish, and the caller saves the audio generated so far.
     """
     import threading
 
@@ -2681,12 +2712,22 @@ def _run_with_heartbeat(work, label, interval=15):
 
     started = time.time()
     thread = threading.Thread(target=runner, daemon=True)
+    previous = _INTERRUPT_CONTEXT.get("flag")
+    if stop_flag is not None:
+        _INTERRUPT_CONTEXT["flag"] = stop_flag
     thread.start()
-    while thread.is_alive():
-        thread.join(interval)
-        if thread.is_alive():
-            print(f"  ... {label} still working ({time.time() - started:.0f}s)",
-                  flush=True)
+    last_beat = started
+    try:
+        while thread.is_alive():
+            # Short waits keep Ctrl+C responsive on Windows, where signals are
+            # only handled once a blocking wait returns.
+            thread.join(0.5)
+            if thread.is_alive() and time.time() - last_beat >= interval:
+                last_beat = time.time()
+                print(f"  ... {label} still working "
+                      f"({time.time() - started:.0f}s)", flush=True)
+    finally:
+        _INTERRUPT_CONTEXT["flag"] = previous
     if "error" in box:
         raise box["error"]
     return box.get("value")
@@ -3364,6 +3405,11 @@ def _assemble_enhanced_dialogue(dialogue_items, voice_data, tts_design_obj=None,
                 shutil.move(raw_file, processed_file)
             has_time = directives.get('has_time', False)
             clips.append((has_time, start_pad, processed_file))
+            if (getattr(tts_vc_obj, 'stopped_early', False)
+                    or getattr(tts_design_obj, 'stopped_early', False)):
+                print(f"  Stopped after line {i + 1}/{len(dialogue_items)} - "
+                      f"keeping {len(clips)} line(s) of audio.", flush=True)
+                break
         if len(clips) < 1:
             return False, "No audio segments generated"
         tracks = []
@@ -3492,6 +3538,8 @@ class QwenTTSVoiceDesign:
             started = time.time()
             audio_parts = []
             sample_rate = None
+            stop_flag = []
+            self.stopped_early = False
             for index, chunk in enumerate(chunks, start=1):
                 if len(chunks) > 1:
                     print(f"  Part {index}/{len(chunks)}: \"{chunk[:70]}"
@@ -3507,6 +3555,7 @@ class QwenTTSVoiceDesign:
                         max_new_tokens=_qwen_audio_token_cap(chunk)
                     ),
                     label,
+                    stop_flag=stop_flag,
                 )
                 if sample_rate is None:
                     sample_rate = chunk_sr
@@ -3518,12 +3567,18 @@ class QwenTTSVoiceDesign:
                     print(f"  Part {index}/{len(chunks)} done in "
                           f"{time.time() - part_started:.1f}s; about "
                           f"{remaining / 60:.1f} min left", flush=True)
+                if stop_flag:
+                    self.stopped_early = True
+                    print(f"  Stopped after part {index}/{len(chunks)} - "
+                          f"keeping {index} part(s).", flush=True)
+                    break
             if sample_rate is None:
                 return False
             audio = _join_audio_parts(audio_parts, sample_rate)
             sf.write(output_path, audio, sample_rate)
+            partial = " (partial, stopped on request)" if self.stopped_early else ""
             print(f"  Speech ready: {len(audio) / sample_rate:.1f}s of audio "
-                  f"in {time.time() - started:.1f}s", flush=True)
+                  f"in {time.time() - started:.1f}s{partial}", flush=True)
             return True
         except Exception as e:
             print(f"VoiceDesign synthesis error: {e}")
@@ -3545,6 +3600,10 @@ class QwenTTSVoiceDesign:
                 success = self.synthesize(script_text, voice_instruct, temp_file, language)
                 if not success:
                     return False, f"Failed to synthesize segment {i+1}"
+                if getattr(self, 'stopped_early', False):
+                    print(f"  Stopped after line {i + 1}/{len(dialogue_items)} - "
+                          f"keeping {len(temp_files)} line(s).", flush=True)
+                    break
             if len(temp_files) < 2:
                 if temp_files:
                     shutil.copy(temp_files[0], output_path)
@@ -3659,6 +3718,8 @@ class QwenTTS:
             audio_parts = []
             sample_rate = None
             overall_started = time.time()
+            stop_flag = []
+            self.stopped_early = False
             for index, chunk in enumerate(chunks, start=1):
                 if len(chunks) > 1:
                     print(f"  Part {index}/{len(chunks)}: \"{chunk[:70]}"
@@ -3674,6 +3735,7 @@ class QwenTTS:
                         max_new_tokens=_qwen_audio_token_cap(chunk)
                     ),
                     label,
+                    stop_flag=stop_flag,
                 )
                 if sample_rate is None:
                     sample_rate = chunk_sr
@@ -3684,11 +3746,17 @@ class QwenTTS:
                     print(f"  Part {index}/{len(chunks)} done in "
                           f"{time.time() - started:.1f}s; about "
                           f"{remaining / 60:.1f} min left", flush=True)
+                if stop_flag:
+                    self.stopped_early = True
+                    print(f"  Stopped after part {index}/{len(chunks)} - "
+                          f"keeping {index} part(s).", flush=True)
+                    break
             if sample_rate is None:
                 return False
             audio = _join_audio_parts(audio_parts, sample_rate)
             sf.write(output_path, audio, sample_rate)
-            print(f"  Speech ready: {len(audio) / sample_rate:.1f}s of audio",
+            partial = " (partial, stopped on request)" if self.stopped_early else ""
+            print(f"  Speech ready: {len(audio) / sample_rate:.1f}s of audio{partial}",
                   flush=True)
             return True
         except Exception as e:
@@ -18439,6 +18507,7 @@ def oneline_klarify(params):
 
 
 if __name__ == "__main__":
+    _install_sigint_handler()
     if len(sys.argv) > 1:
         if sys.argv[1] == "gui" and len(sys.argv) == 2:
             from voders.gui import launch
