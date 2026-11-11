@@ -2812,6 +2812,30 @@ def _join_audio_parts(parts, sample_rate, gap_seconds=0.06):
     return np.concatenate(joined, axis=0)
 
 
+def _write_wav(path, audio, sample_rate, attempts=4):
+    """Write a wav, retrying briefly if Windows has the file locked.
+
+    Antivirus and the search indexer often grab a fresh .wav for a moment; the
+    very next open then fails with libsndfile's "System error". A short retry
+    is enough and avoids losing a whole line after minutes of generation.
+    """
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            sf.write(path, audio, sample_rate)
+            return True
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.4 * (attempt + 1))
+                try:
+                    if os.path.exists(path) and os.path.getsize(path) == 0:
+                        os.unlink(path)
+                except OSError:
+                    pass
+    raise last_error
+
+
 def _concat_audio_files(file_list, output_path):
     if len(file_list) == 1:
         shutil.copy(file_list[0], output_path)
@@ -3429,8 +3453,17 @@ def _assemble_enhanced_dialogue(dialogue_items, voice_data, tts_design_obj=None,
                                 except Exception:
                                     pass
                         if not success:
+                            # If the lock attempt already wrote this path, some
+                            # Windows indexer/antivirus may still hold it; use a
+                            # fresh name instead of fighting for the same file.
+                            fallback_file = raw_file
+                            if os.path.exists(raw_file):
+                                fallback_file = os.path.join(
+                                    temp_dir, f"design_{i:03d}.wav")
                             success = tts_design_obj.synthesize(
-                                text, voice_instruct, raw_file)
+                                text, voice_instruct, fallback_file)
+                            if success:
+                                raw_file = fallback_file
                         if not success:
                             return False, f"Failed to synthesize line {num}"
                         if tts_vc_obj is not None and char_lower not in design_cloned_prompts:
@@ -3672,7 +3705,7 @@ class QwenTTSVoiceDesign:
             if sample_rate is None:
                 return False
             audio = _join_audio_parts(audio_parts, sample_rate)
-            sf.write(output_path, audio, sample_rate)
+            _write_wav(output_path, audio, sample_rate)
             partial = " (partial, stopped on request)" if self.stopped_early else ""
             print(f"  Speech ready: {len(audio) / sample_rate:.1f}s of audio "
                   f"in {time.time() - started:.1f}s{partial}", flush=True)
@@ -3903,7 +3936,7 @@ class QwenTTS:
             if sample_rate is None:
                 return False
             audio = _join_audio_parts(audio_parts, sample_rate)
-            sf.write(output_path, audio, sample_rate)
+            _write_wav(output_path, audio, sample_rate)
             partial = " (partial, stopped on request)" if self.stopped_early else ""
             print(f"  Speech ready: {len(audio) / sample_rate:.1f}s of audio{partial}",
                   flush=True)
@@ -6897,7 +6930,7 @@ def _design_and_freeze_voice(description, text, language="Auto"):
         sample_path = os.path.join(
             tempfile.gettempdir(),
             f"voder_design_sample_{int(time.time() * 1000)}.wav")
-        sf.write(sample_path, np.asarray(wavs[0]), sample_rate)
+        _write_wav(sample_path, np.asarray(wavs[0]), sample_rate)
     except Exception as exc:
         print(f"  Warning: voice design failed ({exc}).")
         _free_design_model(design)
@@ -6999,7 +7032,7 @@ def _design_line_and_lock(design_engine, clone_engine, text, description,
             max_new_tokens=_qwen_audio_token_cap(first_text),
         )
         first_audio = np.asarray(wavs[0])
-        sf.write(sample_path, first_audio, sample_rate)
+        _write_wav(sample_path, first_audio, sample_rate)
         if not clone_engine.extract_voice(sample_path, ref_text=first_text):
             return False, None
         prompt = clone_engine.voice_prompt
@@ -7020,8 +7053,8 @@ def _design_line_and_lock(design_engine, clone_engine, text, description,
             audio_parts.append(part)
             if pause > 0:
                 audio_parts.append(_silence_like(part, sample_rate, pause))
-        sf.write(output_path, _join_audio_parts(audio_parts, sample_rate),
-                 sample_rate)
+        _write_wav(output_path,
+                   _join_audio_parts(audio_parts, sample_rate), sample_rate)
         return True, prompt
     except Exception as exc:
         print(f"  Warning: could not keep the designed voice ({exc}).")
