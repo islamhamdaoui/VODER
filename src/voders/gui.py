@@ -2928,7 +2928,8 @@ class TTSTab(QWidget):
         elif use_description:
             self.tts_voice_help.setText(
                 "Describe the voice you want, e.g. warm, friendly female voice. "
-                "This creates a voice style; it does NOT load a saved clone. "
+                "VODER designs it once, then keeps that exact voice for every "
+                "part and every page with the same description. "
                 "Arabic can't be described - it is cloned from a saved Darija voice, "
                 "so pick 'Saved voices' instead."
             )

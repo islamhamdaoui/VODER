@@ -59,6 +59,7 @@
     - [One‑Liner Dialogue](#one-liner-dialogue)
   - [Voice Prompt Configuration](#voice-prompt-configuration)
   - [Pauses in Speech](#pauses-in-speech)
+  - [One Voice per Description](#one-voice-per-description)
   - [Script Directives](#script-directives)
     - [Time Positioning](#time-positioning)
     - [Volume Level Control](#volume-level-control)
@@ -2741,6 +2742,26 @@ No, Manu, not today.
 The tag is never read aloud. `[pause:N]` is exact on the standard engine
 (Qwen3-TTS); with Enhanced Synthesis (Fish S2-Pro) it becomes a plain
 `[pause]`, and the Darija engine ignores it.
+
+---
+
+## One Voice per Description
+
+A voice *description* (e.g. "warm mother telling a bedtime story") is not a
+fixed speaker - the design model picks a new random speaker each time it is
+called. Because long text is spoken in parts (and a story is generated page by
+page), that used to mean a different voice in every part.
+
+VODER now designs the voice **once**, saves it, and reuses it:
+
+- The first part of the first line is designed from your description.
+- Every other part, line and page with the **same description** is cloned from
+  that voice, so it cannot change.
+- The result is stored in `voices/.designed/` (not listed as a user voice).
+
+To get a different voice, either change the description slightly, or delete the
+matching file in `voices/.designed/`. Picking a **saved voice** instead of a
+description skips all of this - a saved voice is always the same voice.
 
 ---
 

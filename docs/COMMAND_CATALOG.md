@@ -142,6 +142,14 @@ Notes:
 - `[pause:N]` is exact only on the standard engine (Qwen3-TTS). With `extreme`
   (Fish S2-Pro) it becomes a plain `[pause]`; the Darija engine ignores it.
 
+### Voice Design Consistency
+
+A voice *description* is turned into one real voice the first time it is used,
+then reused for every part, line and page with the same description. The voice
+is cached in `voices/.designed/` (not listed as a user voice); change the
+description or delete the cache file to get a different voice. Saved voices
+(`voice "<name>"`) are always consistent by definition.
+
 ### Dialogue Mode
 
 Multiple characters. Use `Character:` prefix in script and voice/target.

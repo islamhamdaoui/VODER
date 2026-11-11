@@ -3325,6 +3325,12 @@ def _assemble_enhanced_dialogue(dialogue_items, voice_data, tts_design_obj=None,
         sfx_generator = None
         design_audio_tracker = {}
         design_cloned_prompts = {}
+        for char_lower, description in (voice_data or {}).items():
+            cached = _load_designed_voice(description, "Auto")
+            if cached is not None:
+                design_cloned_prompts[char_lower.lower()] = cached
+                print(f"Reusing the voice already designed for "
+                      f"'{char_lower}'.", flush=True)
         sts_vc_obj = None
         if sts_refs:
             sts_vc_obj = SeedVCV2()
@@ -3406,30 +3412,53 @@ def _assemble_enhanced_dialogue(dialogue_items, voice_data, tts_design_obj=None,
                         if tts_design_obj is None:
                             return False, "TTS design object not provided"
                         voice_instruct = voice_data[char_lower]
-                        success = tts_design_obj.synthesize(text, voice_instruct, raw_file)
+                        success = False
+                        locked_prompt = None
+                        if isinstance(tts_vc_obj, QwenTTS):
+                            success, locked_prompt = _design_line_and_lock(
+                                tts_design_obj, tts_vc_obj, text,
+                                voice_instruct, raw_file)
+                            if locked_prompt is not None:
+                                design_cloned_prompts[char_lower] = locked_prompt
+                                print(f"  Keeping {char}'s designed voice for the "
+                                      f"rest of the line and the next pages.",
+                                      flush=True)
+                                try:
+                                    _save_designed_voice(
+                                        voice_instruct, "Auto", locked_prompt)
+                                except Exception:
+                                    pass
+                        if not success:
+                            success = tts_design_obj.synthesize(
+                                text, voice_instruct, raw_file)
                         if not success:
                             return False, f"Failed to synthesize line {num}"
                         if tts_vc_obj is not None and char_lower not in design_cloned_prompts:
                             if char_lower not in design_audio_tracker:
                                 design_audio_tracker[char_lower] = []
                             design_audio_tracker[char_lower].append(raw_file)
-                            if len(design_audio_tracker[char_lower]) >= 3:
+                            if len(design_audio_tracker[char_lower]) >= 2:
                                 concat_path = os.path.join(temp_dir, f"design_clone_{char_lower}_{int(time.time())}.wav")
                                 if _concat_audio_files(design_audio_tracker[char_lower], concat_path):
-                                    extracted = svs_extract_vocals(concat_path)
-                                    clone_src = extracted if extracted and extracted != concat_path else concat_path
+                                    # Generated speech is already clean; running
+                                    # the music separator over it changes the very
+                                    # timbre we are trying to keep.
+                                    clone_src = concat_path
                                     try:
                                         clone_ref_text = _transcribe_for_qwen_ref(clone_src)
                                         clone_success = tts_vc_obj.extract_voice(clone_src, ref_text=clone_ref_text if clone_ref_text else None)
                                         if clone_success and tts_vc_obj.voice_prompt is not None:
                                             design_cloned_prompts[char_lower] = tts_vc_obj.voice_prompt
+                                            print(f"  Keeping {char}'s designed voice for the "
+                                                  f"rest of the lines.", flush=True)
+                                            try:
+                                                _save_designed_voice(
+                                                    voice_data[char_lower], "Auto",
+                                                    tts_vc_obj.voice_prompt)
+                                            except Exception:
+                                                pass
                                     except:
                                         pass
-                                    if extracted and extracted != concat_path:
-                                        try:
-                                            os.unlink(extracted)
-                                        except:
-                                            pass
                 if sts_vc_obj is not None and sts_refs and char_lower in sts_refs:
                     sts_ref_path = sts_refs[char_lower]
                     if os.path.exists(raw_file) and sts_ref_path and os.path.exists(sts_ref_path):
@@ -6758,6 +6787,252 @@ def _load_voice_prompt(filepath):
         ))
     return items
 
+DESIGNED_VOICE_CACHE_DIR = os.path.join(VOICES_DIR, ".designed")
+DESIGNED_VOICE_CACHE_VERSION = 1
+DESIGNED_VOICE_CACHE_LIMIT = 50
+
+
+def _designed_voice_key(description, language="Auto"):
+    import hashlib
+    raw = (f"v{DESIGNED_VOICE_CACHE_VERSION}|{language or 'Auto'}|"
+           f"{(description or '').strip().lower()}")
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _designed_voice_path(description, language="Auto"):
+    os.makedirs(DESIGNED_VOICE_CACHE_DIR, exist_ok=True)
+    return os.path.join(DESIGNED_VOICE_CACHE_DIR,
+                        f"design_{_designed_voice_key(description, language)}.tts")
+
+
+def _load_designed_voice(description, language="Auto"):
+    """Return the voice already designed from this description, if any."""
+    path = _designed_voice_path(description, language)
+    if not os.path.exists(path):
+        return None
+    try:
+        return _load_voice_prompt(path)
+    except Exception:
+        return None
+
+
+def _save_designed_voice(description, language, voice_prompt_items):
+    from dataclasses import asdict, is_dataclass
+    path = _designed_voice_path(description, language)
+    items = voice_prompt_items if isinstance(voice_prompt_items, list) else [voice_prompt_items]
+    payload_items = [asdict(it) if is_dataclass(it) else dict(it) for it in items]
+    torch.save({
+        "items": payload_items,
+        "character": "designed",
+        "timestamp": time.strftime("%Y%m%d_%H%M%S"),
+        "description": description,
+        "language": language,
+        "version": DESIGNED_VOICE_CACHE_VERSION,
+    }, path)
+    _trim_designed_voice_cache()
+    return path
+
+
+def _trim_designed_voice_cache():
+    try:
+        files = sorted(
+            (os.path.join(DESIGNED_VOICE_CACHE_DIR, name)
+             for name in os.listdir(DESIGNED_VOICE_CACHE_DIR)
+             if name.endswith(".tts")),
+            key=os.path.getmtime)
+        for path in files[:-DESIGNED_VOICE_CACHE_LIMIT]:
+            os.unlink(path)
+    except Exception:
+        pass
+
+
+def _design_sample_text(text, max_chars=220):
+    """The first sentences of the script, used to design the voice once."""
+    sample = ""
+    for chunk, _pause in _plan_tts_units(text):
+        if sample and len(sample) + 1 + len(chunk) > max_chars:
+            break
+        sample = f"{sample} {chunk}".strip()
+        if len(sample) >= 90:
+            break
+    return sample or (text or "")[:max_chars]
+
+
+def _free_design_model(design_engine):
+    try:
+        design_engine.model = None
+    except Exception:
+        pass
+    del design_engine
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _design_and_freeze_voice(description, text, language="Auto"):
+    """Design one sample from a description, then turn it into a real clone.
+
+    Voice design draws a brand-new speaker on every call, so a story split into
+    parts (or several pages) changes voice constantly. Here the description is
+    turned into one actual voice the first time and reused afterwards.
+    """
+    sample_text = _design_sample_text(text)
+    if not sample_text:
+        return None
+    print("  Designing the voice once, then keeping it for the whole story...",
+          flush=True)
+    design = QwenTTSVoiceDesign()
+    if design.model is None:
+        return None
+    try:
+        wavs, sample_rate = design.model.generate_voice_design(
+            text=sample_text,
+            language=language,
+            instruct=description,
+            max_new_tokens=_qwen_audio_token_cap(sample_text),
+        )
+        sample_path = os.path.join(
+            tempfile.gettempdir(),
+            f"voder_design_sample_{int(time.time() * 1000)}.wav")
+        sf.write(sample_path, np.asarray(wavs[0]), sample_rate)
+    except Exception as exc:
+        print(f"  Warning: voice design failed ({exc}).")
+        _free_design_model(design)
+        return None
+    _free_design_model(design)
+
+    trimmed, trim_cleanup = _trim_clone_reference(sample_path)
+    try:
+        if trimmed == sample_path:
+            ref_text = sample_text
+        else:
+            ref_text = _transcribe_for_qwen_ref(trimmed) or sample_text
+        tts = QwenTTS()
+        if tts.model is None:
+            return None
+        try:
+            if not tts.extract_voice(trimmed, ref_text=ref_text):
+                return None
+            prompt = tts.voice_prompt
+            if prompt is None:
+                return None
+            try:
+                _save_designed_voice(description, language, prompt)
+            except Exception as exc:
+                print(f"  Warning: could not store the designed voice ({exc}).")
+            print("  The same voice will be reused for every part and every page "
+                  "as long as the description stays the same.", flush=True)
+            return tts
+        except Exception as exc:
+            print(f"  Warning: could not freeze the designed voice ({exc}).")
+            return None
+    finally:
+        for path in list(trim_cleanup) + [sample_path]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _tts_with_designed_voice(text, description, output_path, language="Auto"):
+    """Speak with a description, keeping the same voice across parts and pages."""
+    cached = _load_designed_voice(description, language)
+    if cached is not None:
+        print("  Reusing the voice this description already produced.",
+              flush=True)
+        tts = QwenTTS()
+        if tts.model is not None:
+            tts.voice_prompt = cached
+            try:
+                if tts.synthesize(text, output_path, language=language):
+                    return True
+            finally:
+                _tts_cleanup(tts)
+
+    tts = _design_and_freeze_voice(description, text, language)
+    if tts is not None:
+        try:
+            return bool(tts.synthesize(text, output_path, language=language))
+        finally:
+            _tts_cleanup(tts)
+
+    print("  Falling back to designing the voice on the fly.", flush=True)
+    design = QwenTTSVoiceDesign()
+    if design.model is None:
+        return False
+    try:
+        return bool(design.synthesize(text, description, output_path, language))
+    finally:
+        _free_design_model(design)
+
+
+def _silence_like(part, sample_rate, seconds):
+    shape = list(part.shape)
+    shape[0] = int(sample_rate * seconds)
+    return np.zeros(shape, dtype=part.dtype)
+
+
+def _design_line_and_lock(design_engine, clone_engine, text, description,
+                          output_path, language="Auto"):
+    """Design this line's first sentence, then speak the rest with that voice.
+
+    Voice design samples a new speaker on every call, so a page split into
+    parts came out with a different voice in every part. Designing one short
+    part and cloning the rest keeps the whole line (and every later line that
+    reuses the returned prompt) in the same voice.
+    """
+    units = _plan_tts_units(text, max_chars=160)
+    if not units:
+        return False, None
+    sample_path = os.path.join(
+        tempfile.gettempdir(),
+        f"voder_design_line_{int(time.time() * 1000)}.wav")
+    try:
+        first_text, first_pause = units[0]
+        wavs, sample_rate = design_engine.model.generate_voice_design(
+            text=first_text,
+            language=language,
+            instruct=description,
+            max_new_tokens=_qwen_audio_token_cap(first_text),
+        )
+        first_audio = np.asarray(wavs[0])
+        sf.write(sample_path, first_audio, sample_rate)
+        if not clone_engine.extract_voice(sample_path, ref_text=first_text):
+            return False, None
+        prompt = clone_engine.voice_prompt
+        if prompt is None:
+            return False, None
+
+        audio_parts = [first_audio]
+        if first_pause > 0:
+            audio_parts.append(_silence_like(first_audio, sample_rate, first_pause))
+        for chunk, pause in units[1:]:
+            wavs, sample_rate = clone_engine.model.generate_voice_clone(
+                text=chunk,
+                language=language,
+                voice_clone_prompt=prompt,
+                max_new_tokens=_qwen_audio_token_cap(chunk),
+            )
+            part = np.asarray(wavs[0])
+            audio_parts.append(part)
+            if pause > 0:
+                audio_parts.append(_silence_like(part, sample_rate, pause))
+        sf.write(output_path, _join_audio_parts(audio_parts, sample_rate),
+                 sample_rate)
+        return True, prompt
+    except Exception as exc:
+        print(f"  Warning: could not keep the designed voice ({exc}).")
+        return False, None
+    finally:
+        try:
+            os.unlink(sample_path)
+        except OSError:
+            pass
+
+
 def _find_voice_file(name, kind=None, prefer_enhanced=False):
     """Find a saved voice profile by name (also accepts a file path)."""
     return _voice_lib.find_voice(name, kind=kind, prefer_enhanced=prefer_enhanced)
@@ -9414,15 +9689,11 @@ def oneline_tts(params):
                         except:
                             pass
             else:
-                print("Loading Qwen-TTS VoiceDesign model...")
-                tts_design = QwenTTSVoiceDesign()
-                if tts_design.model is None:
-                    print("Error: Failed to load VoiceDesign model")
-                    return False
-                print("Generating speech...")
+                print("Generating speech with the described voice...")
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 output_path = os.path.join(results_dir, f"voder_tts_{timestamp}.wav")
-                success = tts_design.synthesize(script, voice_prompt, output_path)
+                success = _tts_with_designed_voice(
+                    script, voice_prompt, output_path)
                 if not success:
                     print("Error: VoiceDesign synthesis failed")
                     return False
