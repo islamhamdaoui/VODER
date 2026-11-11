@@ -2521,7 +2521,11 @@ class TTSTab(QWidget):
         self.container_layout.addWidget(self.tts_script_label)
 
         self.tts_script_text = QTextEdit()
-        self.tts_script_text.setPlaceholderText("Enter text...")
+        self.tts_script_text.setPlaceholderText(
+            "Enter text...\n\n"
+            "Tip: write [pause] between lines for a silence, or [pause:1.5] "
+            "for 1.5 seconds."
+        )
         self.tts_script_text.setStyleSheet(get_text_edit_style())
         self.tts_script_text.setMinimumHeight(100)
         self.tts_script_text.setMaximumHeight(200)

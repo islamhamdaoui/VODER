@@ -120,6 +120,28 @@ python voder.py tts ocr "path/to/image.png" voice "text: female voice"
 python voder.py tts ocr "path/to/image.png" target "text: voice.wav"
 ```
 
+### Pauses Between Lines
+
+`[pause]` is removed from the text and replaced by real silence, so a stack of
+lines is not read as one breathless run. It works in Single and Dialogue mode.
+
+| You write | You get |
+|---|---|
+| `[pause]` | 0.8 s of silence |
+| `[pause:2]` or `[pause:1.5]` | that many seconds (max 10) |
+| `[silence]` | 0.8 s of silence (alias) |
+| a blank line between two paragraphs | 0.6 s of silence |
+
+```
+python voder.py tts script "Monday was bright and sunny. [pause] Will it rain today? [pause:1.2] No, Manu, not today." voice "storyteller"
+```
+
+Notes:
+
+- The tag is never spoken, and it does not count towards the part length.
+- `[pause:N]` is exact only on the standard engine (Qwen3-TTS). With `extreme`
+  (Fish S2-Pro) it becomes a plain `[pause]`; the Darija engine ignores it.
+
 ### Dialogue Mode
 
 Multiple characters. Use `Character:` prefix in script and voice/target.

@@ -58,6 +58,7 @@
     - [Interactive CLI Dialogue](#interactive-cli-dialogue)
     - [One‑Liner Dialogue](#one-liner-dialogue)
   - [Voice Prompt Configuration](#voice-prompt-configuration)
+  - [Pauses in Speech](#pauses-in-speech)
   - [Script Directives](#script-directives)
     - [Time Positioning](#time-positioning)
     - [Volume Level Control](#volume-level-control)
@@ -2716,6 +2717,30 @@ python src/voder.py tts \
 - Load reference audio files (numbered 1, 2, 3...)
 - Each character gets a dropdown to select an audio number
 - Same audio can be used for multiple characters
+
+---
+
+## Pauses in Speech
+
+Write `[pause]` between phrases to get real silence instead of a rushed join.
+Useful when you paste many lines at once.
+
+| You write | You get |
+|---|---|
+| `[pause]` | 0.8 s of silence |
+| `[pause:2]` / `[pause:1.5]` | that many seconds (max 10) |
+| `[silence]` | 0.8 s (alias) |
+| a blank line between paragraphs | 0.6 s |
+
+```plaintext
+Monday was bright and sunny. [pause]
+Will it rain today, Mummy? [pause:1.2]
+No, Manu, not today.
+```
+
+The tag is never read aloud. `[pause:N]` is exact on the standard engine
+(Qwen3-TTS); with Enhanced Synthesis (Fish S2-Pro) it becomes a plain
+`[pause]`, and the Darija engine ignores it.
 
 ---
 

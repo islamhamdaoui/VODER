@@ -2663,6 +2663,67 @@ def _split_text_for_tts(text, max_chars=340):
     return final
 
 
+TTS_PAUSE_DEFAULT_SECONDS = 0.8
+TTS_PAUSE_MAX_SECONDS = 10.0
+TTS_PARAGRAPH_PAUSE_SECONDS = 0.6
+# [pause] / [pause:1.5] / [silence] is removed from the text and becomes real
+# silence between phrases.
+_TTS_PAUSE_TAG_RE = re.compile(
+    r"\[\s*(?:pause|silence)\s*(?:[=:]\s*([0-9]+(?:\.[0-9]+)?))?\s*\]", re.I)
+_TTS_TIMED_PAUSE_TAG_RE = re.compile(
+    r"\[\s*(?:pause|silence)\s*[=:]\s*[0-9]+(?:\.[0-9]+)?\s*\]", re.I)
+_TTS_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n")
+
+
+def _tts_pause_seconds(raw, default=TTS_PAUSE_DEFAULT_SECONDS):
+    """Seconds requested by a pause tag, clamped to a sane range."""
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, 0.0), TTS_PAUSE_MAX_SECONDS)
+
+
+def _strip_tts_pause_tags(text):
+    """Remove pause tags for engines that cannot insert silence on demand."""
+    return _TTS_PAUSE_TAG_RE.sub(" ", text or "")
+
+
+def _append_tts_units(units, segment, pause_after, max_chars):
+    parts = _TTS_PARAGRAPH_BREAK_RE.split(segment or "")
+    for index, part in enumerate(parts):
+        pause = pause_after if index == len(parts) - 1 else TTS_PARAGRAPH_PAUSE_SECONDS
+        chunks = _split_text_for_tts(part, max_chars=max_chars)
+        for chunk in chunks:
+            units.append([chunk, 0.0])
+        if chunks:
+            if pause > 0:
+                units[-1][1] = min(TTS_PAUSE_MAX_SECONDS, units[-1][1] + pause)
+        elif pause > 0 and units:
+            # Two tags back to back, or a tag right after one: keep the silence.
+            units[-1][1] = min(TTS_PAUSE_MAX_SECONDS, units[-1][1] + pause)
+
+
+def _plan_tts_units(text, max_chars=QWEN_TTS_PART_CHARS):
+    """Turn script text into ``[[chunk, pause_seconds_after], ...]``.
+
+    ``[pause]`` adds a 0.8 s silence, ``[pause:2]`` a custom one (up to 10 s),
+    ``[silence]`` is an alias. A blank line also becomes a short pause, so a
+    stack of lines is not read as one breathless run.
+    """
+    units = []
+    text = text or ""
+    position = 0
+    for match in _TTS_PAUSE_TAG_RE.finditer(text):
+        seconds = _tts_pause_seconds(match.group(1))
+        _append_tts_units(units, text[position:match.start()], seconds, max_chars)
+        position = match.end()
+    _append_tts_units(units, text[position:], 0.0, max_chars)
+    return units
+
+
 _INTERRUPT_CONTEXT = {"flag": None}
 
 
@@ -3523,14 +3584,15 @@ class QwenTTSVoiceDesign:
             # (model ceiling: 2048 tokens, i.e. ~2m50s). A pasted multi-page
             # script is one enormous pass that can run for ten minutes and then
             # drift or cut off, so long text is spoken in sentence-sized parts.
-            chunks = _split_text_for_tts(text, max_chars=QWEN_TTS_PART_CHARS)
-            if not chunks:
+            units = _plan_tts_units(text, max_chars=QWEN_TTS_PART_CHARS)
+            if not units:
                 return False
-            if len(chunks) > 1:
+            words = len(" ".join(unit[0] for unit in units).split())
+            if len(units) > 1:
                 estimate = words / 2.5
                 print(f"  Note: {words} words is long for one pass "
                       f"(~{estimate:.0f}s of speech). Splitting into "
-                      f"{len(chunks)} parts so it cannot stall or get cut off.",
+                      f"{len(units)} parts so it cannot stall or get cut off.",
                       flush=True)
                 print("  Tip: the voice may shift slightly between parts - save "
                       "a voice from one good take to keep it identical.",
@@ -3540,13 +3602,13 @@ class QwenTTSVoiceDesign:
             sample_rate = None
             stop_flag = []
             self.stopped_early = False
-            for index, chunk in enumerate(chunks, start=1):
-                if len(chunks) > 1:
-                    print(f"  Part {index}/{len(chunks)}: \"{chunk[:70]}"
+            for index, (chunk, pause_after) in enumerate(units, start=1):
+                if len(units) > 1:
+                    print(f"  Part {index}/{len(units)}: \"{chunk[:70]}"
                           f"{'...' if len(chunk) > 70 else ''}\"", flush=True)
                 part_started = time.time()
-                label = (f"speech part {index}/{len(chunks)}"
-                         if len(chunks) > 1 else "speech")
+                label = (f"speech part {index}/{len(units)}"
+                         if len(units) > 1 else "speech")
                 wavs, chunk_sr = _run_with_heartbeat(
                     lambda chunk=chunk: self.model.generate_voice_design(
                         text=chunk,
@@ -3560,16 +3622,22 @@ class QwenTTSVoiceDesign:
                 if sample_rate is None:
                     sample_rate = chunk_sr
                 audio_parts.append(np.asarray(wavs[0]))
-                if len(chunks) > 1:
+                if pause_after > 0:
+                    pad_shape = list(audio_parts[-1].shape)
+                    pad_shape[0] = int(sample_rate * pause_after)
+                    audio_parts[-1] = np.concatenate(
+                        [audio_parts[-1],
+                         np.zeros(pad_shape, dtype=audio_parts[-1].dtype)], axis=0)
+                if len(units) > 1:
                     done = index
                     average = (time.time() - started) / done
-                    remaining = average * (len(chunks) - done)
-                    print(f"  Part {index}/{len(chunks)} done in "
+                    remaining = average * (len(units) - done)
+                    print(f"  Part {index}/{len(units)} done in "
                           f"{time.time() - part_started:.1f}s; about "
                           f"{remaining / 60:.1f} min left", flush=True)
                 if stop_flag:
                     self.stopped_early = True
-                    print(f"  Stopped after part {index}/{len(chunks)} - "
+                    print(f"  Stopped after part {index}/{len(units)} - "
                           f"keeping {index} part(s).", flush=True)
                     break
             if sample_rate is None:
@@ -3750,14 +3818,15 @@ class QwenTTS:
             return False
         try:
             import soundfile as sf
-            chunks = _split_text_for_tts(text, max_chars=QWEN_TTS_PART_CHARS)
-            if not chunks:
+            units = _plan_tts_units(text, max_chars=QWEN_TTS_PART_CHARS)
+            if not units:
                 return False
-            total_chars = sum(len(chunk) for chunk in chunks)
-            print(f"  Speaking {len(text.split())} words ({total_chars} chars) "
-                  f"in {len(chunks)} part(s), about "
-                  f"{len(text.split()) / 2.5:.0f}s of speech...", flush=True)
-            if len(chunks) > 1:
+            total_chars = sum(len(unit[0]) for unit in units)
+            words = len(" ".join(unit[0] for unit in units).split())
+            print(f"  Speaking {words} words ({total_chars} chars) "
+                  f"in {len(units)} part(s), about "
+                  f"{words / 2.5:.0f}s of speech...", flush=True)
+            if len(units) > 1:
                 print("  Note: long text is spoken in parts so it cannot stall "
                       "in one pass.", flush=True)
             audio_parts = []
@@ -3765,13 +3834,13 @@ class QwenTTS:
             overall_started = time.time()
             stop_flag = []
             self.stopped_early = False
-            for index, chunk in enumerate(chunks, start=1):
-                if len(chunks) > 1:
-                    print(f"  Part {index}/{len(chunks)}: \"{chunk[:70]}"
+            for index, (chunk, pause_after) in enumerate(units, start=1):
+                if len(units) > 1:
+                    print(f"  Part {index}/{len(units)}: \"{chunk[:70]}"
                           f"{'...' if len(chunk) > 70 else ''}\"", flush=True)
                 started = time.time()
-                label = (f"part {index}/{len(chunks)}"
-                         if len(chunks) > 1 else "speech")
+                label = (f"part {index}/{len(units)}"
+                         if len(units) > 1 else "speech")
                 wavs, chunk_sr = _run_with_heartbeat(
                     lambda chunk=chunk: self.model.generate_voice_clone(
                         text=chunk,
@@ -3785,15 +3854,21 @@ class QwenTTS:
                 if sample_rate is None:
                     sample_rate = chunk_sr
                 audio_parts.append(np.asarray(wavs[0]))
-                if len(chunks) > 1:
+                if pause_after > 0:
+                    pad_shape = list(audio_parts[-1].shape)
+                    pad_shape[0] = int(sample_rate * pause_after)
+                    audio_parts[-1] = np.concatenate(
+                        [audio_parts[-1],
+                         np.zeros(pad_shape, dtype=audio_parts[-1].dtype)], axis=0)
+                if len(units) > 1:
                     average = (time.time() - overall_started) / index
-                    remaining = average * (len(chunks) - index)
-                    print(f"  Part {index}/{len(chunks)} done in "
+                    remaining = average * (len(units) - index)
+                    print(f"  Part {index}/{len(units)} done in "
                           f"{time.time() - started:.1f}s; about "
                           f"{remaining / 60:.1f} min left", flush=True)
                 if stop_flag:
                     self.stopped_early = True
-                    print(f"  Stopped after part {index}/{len(chunks)} - "
+                    print(f"  Stopped after part {index}/{len(units)} - "
                           f"keeping {index} part(s).", flush=True)
                     break
             if sample_rate is None:
@@ -3879,6 +3954,10 @@ class FishTTS:
             import torch
             import soundfile as sf
             from fish_speech.models.text2semantic.inference import generate_long, decode_to_audio
+            if _TTS_TIMED_PAUSE_TAG_RE.search(text or ""):
+                print("  Note: this engine accepts [pause] but not [pause:N] - "
+                      "using a plain [pause].", flush=True)
+                text = _TTS_TIMED_PAUSE_TAG_RE.sub("[pause]", text or "")
             prompt_tokens = self.encoded_refs["tokens"].to(self.device)
             prompt_text = self.encoded_refs["text"]
             all_audio = []
@@ -6863,6 +6942,7 @@ def show_oneline_usage():
     print()
     print("Parameters (can appear multiple times):")
     print("  script   - Dialogue line in 'Character: text' format, or plain text for single mode")
+    print("             Write [pause] between phrases for silence ([pause:1.5] = 1.5 seconds)")
     print("  voice    - Voice prompt in 'Character: description' format (TTS)")
     print("  target   - Audio file path in 'Character: path' format (voice clone) or single path (STS)")
     print("  lyrics   - Song lyrics for TTM / remix (single, optional for remix)")
@@ -8238,6 +8318,10 @@ def _maybe_handle_darija_tts(params):
 
         pieces = []
         for index, (key, _name, text) in enumerate(assignments):
+            if _TTS_PAUSE_TAG_RE.search(text or ""):
+                print("  Note: [pause] tags are not supported by the Darija "
+                      "engine; they are ignored.", flush=True)
+                text = _strip_tts_pause_tags(text)
             if not engine.load_voice(profiles[key]):
                 print("Error: could not load the Darija voice")
                 return False
